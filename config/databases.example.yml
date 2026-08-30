@@ -54,6 +54,9 @@ databases:
       - name: oci-arquivo-frio
         type: oci_par
         par_url_env: MEIRE_OCI_PAR_URL   # PAR "bucket-level" com permissão de escrita (e leitura, se quiser verify_upload)
+      - name: disco-secundario
+        type: local
+        path: /mnt/backup-secundario/meire-decoracoes/   # precisa estar montado como volume no compose
     webhook_url_env: MEIRE_WEBHOOK_URL   # opcional; se ausente usa DEFAULT_WEBHOOK_URL do .env
 
   - id: outro-projeto

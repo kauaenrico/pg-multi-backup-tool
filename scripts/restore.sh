@@ -27,7 +27,7 @@ first_destination_name() {
 }
 
 download_from_destination() {
-    local dest_name="$1" fname="$2" dest type remote bucket prefix var url
+    local dest_name="$1" fname="$2" dest type remote bucket prefix var url dest_path
     dest=$(find_destination "$DB_ID" "$dest_name")
     [ -n "$dest" ] || { echo "[restore] ERRO: destino '${dest_name}' não encontrado para '${DB_ID}'" >&2; exit 1; }
     type=$(echo "$dest" | jq -r '.type')
@@ -50,6 +50,13 @@ download_from_destination() {
             curl -fsS -o "${BACKUP_DIR}/${fname}" "${url}/${fname}" \
                 || { echo "[restore] ERRO: download falhou (a PAR precisa permitir leitura)"; exit 1; }
             curl -fsS -o "${BACKUP_DIR}/${fname}.sha256" "${url}/${fname}.sha256" 2>/dev/null || true
+            ;;
+        local)
+            dest_path=$(echo "$dest" | jq -r '.path')
+            echo "[restore] copiando '${fname}' de '${dest_name}' (local: ${dest_path})"
+            cp "${dest_path}/${fname}" "$BACKUP_DIR/" \
+                || { echo "[restore] ERRO: cópia falhou (arquivo não encontrado em ${dest_path})"; exit 1; }
+            cp "${dest_path}/${fname}.sha256" "$BACKUP_DIR/" 2>/dev/null || true
             ;;
         *)
             echo "[restore] ERRO: tipo de destino desconhecido '${type}'"; exit 1 ;;
@@ -87,6 +94,10 @@ case "$MODE" in
                     echo "[restore] ERRO: nenhum backup encontrado em '${DEST_NAME}' (a PAR precisa ter listagem habilitada; se não tiver, use: restore.sh $DB_ID remote $DEST_NAME <nome-do-arquivo>)" >&2
                     exit 1
                 fi
+                ;;
+            local)
+                LOCAL_DEST_PATH=$(echo "$DEST_JSON" | jq -r '.path')
+                LATEST=$(find "$LOCAL_DEST_PATH" -maxdepth 1 -name "${DB_ID}_*" ! -name "*.sha256" -printf '%f\n' 2>/dev/null | sort | tail -n1)
                 ;;
             *)
                 echo "[restore] ERRO: tipo de destino desconhecido '${DEST_TYPE}'" >&2; exit 1 ;;

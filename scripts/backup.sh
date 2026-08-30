@@ -69,6 +69,9 @@ while IFS= read -r dest; do
         oci_par)
             upload_oci_par "$DB_ID" "$dest" "$FILEPATH" "$SHAFILE" "$DO_VERIFY_UPLOAD" || FAILED_DEST=1
             ;;
+        local)
+            upload_local "$DB_ID" "$dest" "$FILEPATH" "$SHAFILE" "$DO_VERIFY_UPLOAD" || FAILED_DEST=1
+            ;;
         *)
             log "$DB_ID" "AVISO: tipo de destino desconhecido '${TYPE}', ignorando"
             ;;

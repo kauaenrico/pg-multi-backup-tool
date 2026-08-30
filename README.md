@@ -99,6 +99,89 @@ Cada `id` em `databases:` é a unidade atômica de agendamento/retenção/destin
 — exatamente o "parametrizado banco a banco" pedido: dois bancos no mesmo
 servidor Postgres viram duas entradas independentes.
 
+### Referência completa de parâmetros
+
+Qualquer campo de `defaults:` pode ser repetido dentro de um banco específico
+(mesmo caminho) para sobrescrever só aquele banco; o que não for repetido
+herda de `defaults:`, e o que não estiver em nenhum dos dois usa o "default
+do código" indicado abaixo.
+
+**`defaults:`** (raiz do YAML — os mesmos campos valem dentro de `databases[]`)
+
+| Campo | Tipo | Default do código | Descrição |
+|---|---|---|---|
+| `schedule` | string (cron, 5 campos) | `0 3 * * *` | Horário do backup. **Bancos com o mesmo `schedule` disparam em paralelo** (o `cron` não enfileira) — se tiver muitos bancos, considere escalonar os horários (`03:00`, `03:10`, `03:20`...) pra não competir por CPU/rede no mesmo instante. |
+| `format` | `custom` \| `plain` \| `directory` | `custom` | Formato do `pg_dump` (`-Fc`/`-Fp`/`-Fd`). Com `plain` a checagem estrutural é pulada (`pg_restore --list` não existe pra SQL puro). |
+| `retention.local_days` | inteiro | `7` | Dias que o dump fica no `BACKUP_DIR` de staging (`/backups`) antes de ser apagado. |
+| `retention.remote_days` | inteiro | `30` | Dias até apagar de **cada** destino em `destinations:` — vale para `s3`, `r2`, `oci_par` (se a PAR permitir delete) e `local`. |
+| `verify.structural_check` | boolean | `true` | `pg_restore --list` no dump logo após gerá-lo, antes do upload. |
+| `verify.checksum` | boolean | `true` | Gera `<arquivo>.sha256` e envia junto a cada destino. |
+| `verify.verify_upload` | boolean | `true` | Confere o tamanho do arquivo no destino logo após o envio. |
+| `verify.test_restore` | boolean | `false` | Restore completo num banco descartável no mesmo servidor (`createdb`/`pg_restore`/`dropdb`). Exige `CREATEDB` no `connection.user`; mais caro, por isso opt-in. |
+
+**`remotes[]`** (raiz do YAML — remotes reutilizáveis do rclone, usados por destinos `type: s3`/`type: r2`)
+
+| Campo | Tipo | Obrigatório | Descrição |
+|---|---|---|---|
+| `name` | string | Sim | Referenciado por `destinations[].remote`. |
+| `type` | string | Sim | Hoje só `s3` é escrito pelo `render-rclone-conf.sh` — cobre qualquer backend que fale o protocolo S3 (AWS S3, Cloudflare R2, MinIO, Backblaze B2 via API S3 etc.). |
+| `provider` | string | Não | Dica pro rclone (`AWS`, `Cloudflare`, `Minio`, `Other`...). |
+| `region` | string | Não | Região S3 (ex.: `us-east-1`); ignorado por backends sem conceito de região (R2, por ex.). |
+| `endpoint_env` | string | Depende | Nome da env var com a URL do endpoint. Obrigatório pra qualquer backend que não seja AWS S3 "de verdade" (R2, MinIO...). |
+| `access_key_id_env` | string | Sim | Nome da env var com o Access Key ID. |
+| `secret_access_key_env` | string | Sim | Nome da env var com o Secret Access Key. |
+
+**`databases[]`** (raiz do YAML — um item por banco)
+
+| Campo | Tipo | Obrigatório | Default | Descrição |
+|---|---|---|---|---|
+| `id` | string | Sim | — | Identificador único; vira prefixo do nome do arquivo (`<id>_AAAA-MM-DD_HH-MM-SS.ext`) e é o argumento passado para `backup.sh`/`restore.sh`/`verify.sh`. |
+| `enabled` | boolean | Não | `true` | `false` tira o banco do crontab gerado (ainda dá pra rodar `backup.sh <id>` manualmente). |
+| `schedule` | string (cron) | Não | herda de `defaults` | Override por banco. |
+| `format` | string | Não | herda de `defaults` | Override por banco. |
+| `connection` | objeto | Sim | — | Ver tabela abaixo. |
+| `retention` | objeto | Não | herda de `defaults` | Mesmos campos `local_days`/`remote_days`, por banco. |
+| `verify` | objeto | Não | herda de `defaults` | Mesmos 4 campos de verificação, por banco. |
+| `destinations` | array (≥1) | Sim | — | Ver tabela abaixo. Sem nenhum item, o backup falha de propósito. |
+| `webhook_url_env` | string | Não | usa `DEFAULT_WEBHOOK_URL` do `.env` | Nome da env var com a URL do webhook só pra esse banco. |
+
+**`databases[].connection`**
+
+| Campo | Tipo | Obrigatório | Default | Descrição |
+|---|---|---|---|---|
+| `host` | string | Sim | — | Hostname resolvível na network Docker (nome do container/serviço do Postgres alvo). |
+| `port` | inteiro | Não | `5432` | Porta do Postgres. |
+| `user` | string | Não | `postgres` | Usuário do `pg_dump`/`pg_restore`; precisa de `CREATEDB` se `verify.test_restore: true`. |
+| `database` | string | Sim | — | Nome do banco a ser copiado. |
+| `password_env` | string | Sim | — | Nome da env var (do `.env`) com a senha desse usuário. |
+
+**`databases[].destinations[]`** — campos comuns a todo item:
+
+| Campo | Tipo | Obrigatório | Descrição |
+|---|---|---|---|
+| `name` | string | Sim | Identifica o destino em `restore.sh ... latest/remote <name> ...`, nos logs e no `list.sh`. |
+| `type` | `s3` \| `r2` \| `oci_par` \| `local` | Sim | Define quais campos abaixo se aplicam. |
+
+Campos extras por `type`:
+
+| `type` | Campo | Obrigatório | Descrição |
+|---|---|---|---|
+| `s3` / `r2` | `remote` | Sim | Nome de um remote declarado em `remotes:`. |
+| `s3` / `r2` | `bucket` | Sim | Nome do bucket. |
+| `s3` / `r2` | `prefix` | Não | Prefixo/"pasta" dentro do bucket (ex.: `meu-projeto/`). |
+| `oci_par` | `par_url_env` | Sim | Nome da env var com a URL da PAR (nível de bucket — ver requisitos de permissão na seção de tipos de destino, acima). |
+| `local` | `path` | Sim | Caminho absoluto **dentro do container** onde copiar o dump; precisa estar montado como volume no `docker-compose.yml`. |
+
+**Fora do YAML** (variáveis de ambiente lidas direto pelo container, via `.env`/compose `environment:`):
+
+| Variável | Default | Descrição |
+|---|---|---|
+| `CONFIG_FILE` | `/app/config/databases.yml` | Caminho do YAML dentro do container. |
+| `BACKUP_DIR` | `/backups` | Diretório de staging dos dumps. |
+| `TZ` | `America/Sao_Paulo` | Timezone usado pelo `cron` para interpretar os `schedule`. |
+| `DEFAULT_WEBHOOK_URL` | (vazio = sem notificação) | Webhook usado quando o banco não define `webhook_url_env`. |
+| `WEBHOOK_FORMAT` | `slack` | `slack` (`{"text":...}`) ou `discord` (`{"content":...}`). |
+
 ### Tipos de destino suportados hoje
 
 - **`s3`** / **`r2`** — via `rclone`, para qualquer remote S3-compatível
@@ -124,6 +207,13 @@ servidor Postgres viram duas entradas independentes.
     projeto e uma retenção razoável, isso não chega a ser um problema na
     prática, mas buckets com um volume muito grande de objetos podem não
     aparecer inteiros numa única listagem.
+- **`local`** — copia o dump (e o `.sha256`) para outro caminho dentro do
+  próprio container, via `cp`. Serve pra um segundo disco, um mount de NAS, ou
+  qualquer outro ponto de montagem que não seja o `BACKUP_DIR` de staging
+  (que já tem sua própria retenção via `retention.local_days`, independente
+  disso). O `path` precisa estar montado como volume no `docker-compose.yml`.
+  Suporta upload, `verify_upload`, `latest`, `remote` e retenção automática
+  (mesmo critério de idade por nome de arquivo usado no staging).
 - **Outros métodos**: qualquer backend que o `rclone` suporte (Backblaze B2,
   Google Cloud Storage, Azure Blob, SFTP, WebDAV, disco local...) já funciona
   bastando declarar um novo `remotes:` com `type` compatível e usar
@@ -203,12 +293,31 @@ docker compose exec pg-backup /app/scripts/verify.sh meu-projeto --file /backups
 docker compose exec pg-backup /app/scripts/list.sh
 ```
 
+### 7. Aplicar mudanças de configuração
+
+O `rclone.conf` e o crontab só são gerados **uma vez**, no boot do container
+(`entrypoint.sh`). Editar `config/databases.yml` ou `.env` no host não muda
+nada sozinho — o comando certo depende de qual arquivo mudou (testado e
+confirmado com containers reais):
+
+| O que mudou | Comando | Por quê |
+|---|---|---|
+| `config/databases.yml` (bancos, schedule, retenção, destinos) | `docker compose restart pg-backup` | É um bind mount: o Compose não enxerga isso como mudança de configuração, então `up -d` sozinho **não faz nada** (container continua rodando com o crontab antigo). `restart` reinicia o processo e roda o `entrypoint.sh` de novo, que relê o YAML atual. |
+| `.env` (senhas, chaves, URLs de webhook/PAR) | `docker compose up -d` | O Compose detecta a mudança nas variáveis de ambiente resolvidas e recria o container sozinho (não precisa de `restart` nem `--build`). |
+| `Dockerfile` ou qualquer arquivo em `scripts/` | `docker compose up -d --build` | Precisa reconstruir a imagem antes de recriar o container. |
+| Só quer garantir que pegou tudo, sem pensar em qual regra vale | `docker compose up -d --force-recreate` (ou `--build` junto, se mexeu em código) | Recria do zero sempre, custa só alguns segundos a mais. |
+
+Depois de qualquer uma dessas, confira com `docker compose exec pg-backup /app/scripts/list.sh` e `docker compose exec pg-backup crontab -l` se o crontab reflete o que você esperava.
+
 ## Adicionando um novo projeto
 
 Basta um novo item em `databases:` no YAML (host, credenciais via `.env`,
 schedule, destinos) — sem build de imagem nova, sem editar compose de projeto
-nenhum. Se o projeto estiver numa network Docker diferente da já conectada,
-adicione essa network em `docker-compose.yml` e reinicie o serviço.
+nenhum. Depois, aplique a mudança como descrito acima (`docker compose
+restart pg-backup` cobre o caso comum de só ter mexido no YAML). Se o projeto
+estiver numa network Docker diferente da já conectada, adicione essa network
+em `docker-compose.yml` e rode `docker compose up -d` (mudança no próprio
+arquivo do compose, então o Compose recria o container sozinho).
 
 ## Notas de segurança
 

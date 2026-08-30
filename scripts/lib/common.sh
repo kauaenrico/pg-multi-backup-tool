@@ -114,6 +114,46 @@ resolve_pg_env() {
     export PGPASSWORD
 }
 
+# upload_local <id> <destino-json> <arquivo> <arquivo-sha256-ou-vazio> <verificar:true|false>
+# Copia o dump (e o .sha256, se houver) para outro caminho dentro do próprio
+# container — útil para um segundo disco/NAS/mount montado à parte do
+# BACKUP_DIR de staging (que já tem sua própria retenção via retention.local_days,
+# independente disso). O "path" precisa estar montado como volume no compose.
+upload_local() {
+    local id="$1" dest="$2" filepath="$3" shafile="$4" verify="$5"
+    local name path fname
+    name=$(echo "$dest" | jq -r '.name')
+    path=$(echo "$dest" | jq -r '.path')
+    [ -n "$path" ] && [ "$path" != "null" ] || { log "$id" "ERRO: destino '${name}' (local) sem 'path' configurado"; return 1; }
+    fname=$(basename "$filepath")
+
+    log "$id" "copiando para destino '${name}' (local: ${path})"
+    if ! mkdir -p "$path"; then
+        log "$id" "ERRO: não foi possível criar o diretório '${path}' do destino '${name}'"
+        return 1
+    fi
+    if ! cp "$filepath" "${path}/${fname}"; then
+        log "$id" "ERRO: falha ao copiar para destino '${name}' (${path})"
+        return 1
+    fi
+    if [ -n "$shafile" ]; then
+        cp "$shafile" "${path}/$(basename "$shafile")" 2>/dev/null \
+            || log "$id" "aviso: falha ao copiar checksum para '${name}' (não é fatal)"
+    fi
+
+    if [ "$verify" = "true" ]; then
+        local local_size copied_size
+        local_size=$(stat -c%s "$filepath")
+        copied_size=$(stat -c%s "${path}/${fname}" 2>/dev/null)
+        if [ "$copied_size" != "$local_size" ]; then
+            log "$id" "ERRO: verificação de cópia falhou em '${name}' (origem=${local_size} destino=${copied_size:-desconhecido})"
+            return 1
+        fi
+        log "$id" "verificação de cópia OK em '${name}' (${local_size} bytes)"
+    fi
+    return 0
+}
+
 # upload_rclone <id> <destino-json> <arquivo> <arquivo-sha256-ou-vazio> <verificar:true|false>
 upload_rclone() {
     local id="$1" dest="$2" filepath="$3" shafile="$4" verify="$5"
@@ -209,8 +249,21 @@ apply_remote_retention() {
         case "$type" in
             s3|r2) apply_rclone_retention "$id" "$dest" "$remote_days" ;;
             oci_par) apply_oci_par_retention "$id" "$dest" "$remote_days" ;;
+            local) apply_local_dest_retention "$id" "$dest" "$remote_days" ;;
         esac
     done < <(db_destinations_json "$id")
+}
+
+# apply_local_dest_retention <id> <destino-json> <dias>
+# Mesmo critério do BACKUP_DIR de staging (mtime do arquivo), só que aplicado
+# ao "path" do destino local.
+apply_local_dest_retention() {
+    local id="$1" dest="$2" remote_days="$3" name path
+    name=$(echo "$dest" | jq -r '.name')
+    path=$(echo "$dest" | jq -r '.path')
+    [ -n "$path" ] && [ -d "$path" ] || return
+    find "$path" -maxdepth 1 -name "${id}_*" -mtime "+${remote_days}" -print -delete \
+        | while read -r f; do log "$id" "removido backup antigo em '${name}': $f"; done
 }
 
 apply_rclone_retention() {

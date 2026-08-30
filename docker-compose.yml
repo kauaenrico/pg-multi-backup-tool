@@ -16,6 +16,9 @@ services:
     volumes:
       - ./config/databases.yml:/app/config/databases.yml:ro
       - ./backups:/backups
+      # Exemplo: monte aqui qualquer caminho usado por um destino "type: local"
+      # em databases.yml (segundo disco, NAS via bind mount do host, etc.).
+      # - /mnt/backup-secundario:/mnt/backup-secundario
     networks:
       - padrao
       # Se algum projeto usar uma network externa diferente da compartilhada
