@@ -1,0 +1,29 @@
+# RESTANTE DO COMPOSE OD PROJETO QUE ESTÁ SENDO APLICADO O BACKUP
+# ESSE COMPOSE JA POSSUI UM POSTGRES APLICADO DO PROJETO
+
+  backup:
+    build:
+      context: ./backup
+      args:
+        PG_VERSION: "16"   # mesma versão do serviço "postgres" acima
+    container_name: meire-decoracoes-platform-backup
+    restart: unless-stopped
+    # PID 1 de verdade vira o tini embutido do Docker; o crond (dcron) roda
+    # como PID 2+ em vez de PID 1. Sem isso, dcron -f dá "setpgid: Operation
+    # not permitted" ao tentar virar líder do próprio grupo de processos —
+    # PID 1 já é líder de sessão por padrão, e o kernel recusa a chamada —
+    # e o container entra em loop de restart.
+    init: true
+    logging: *default-logging
+    env_file:
+      - ./backup/.env
+    volumes:
+      - ./backup/backups:/backups
+    depends_on:
+      - postgres
+    networks:
+      - padrao
+
+networks:
+  padrao:
+    external: true

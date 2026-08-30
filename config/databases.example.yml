@@ -1,0 +1,75 @@
+# Copie este arquivo para config/databases.yml e ajuste para o seu ambiente.
+# Nenhum segredo fica em texto puro aqui: todo campo sensível (senha, chaves de
+# API, URL de PAR) é o NOME de uma variável de ambiente, cujo valor real vem do
+# .env carregado no container (veja .env.example).
+
+defaults:
+  schedule: "0 3 * * *"          # cron: todo dia às 03:00 (TZ do container)
+  format: custom                  # custom (pg_dump -Fc) | plain (-Fp) | directory (-Fd)
+  retention:
+    local_days: 7                 # dias que o .dump fica no volume local /backups
+    remote_days: 30                # dias até apagar do destino (só se aplica a s3/r2)
+  verify:
+    structural_check: true        # pg_restore --list logo após o dump (rápido, pega dump corrompido)
+    checksum: true                 # gera e envia um .sha256 junto com o dump
+    verify_upload: true             # confere tamanho do arquivo no destino após o envio
+    test_restore: false              # restore completo num banco descartável (exige CREATEDB); mais caro, opt-in
+
+# Remotes reutilizáveis do rclone (qualquer backend S3-compatível: AWS S3, Cloudflare
+# R2, MinIO, Backblaze B2 via S3 API, etc.). Vários bancos podem apontar para o mesmo remote.
+remotes:
+  - name: r2-principal
+    type: s3
+    provider: Cloudflare
+    endpoint_env: R2_ENDPOINT                  # ex.: https://<account_id>.r2.cloudflarestorage.com
+    access_key_id_env: R2_ACCESS_KEY_ID
+    secret_access_key_env: R2_SECRET_ACCESS_KEY
+
+  - name: s3-aws-generico
+    type: s3
+    provider: AWS
+    region: us-east-1
+    access_key_id_env: AWS_ACCESS_KEY_ID
+    secret_access_key_env: AWS_SECRET_ACCESS_KEY
+
+databases:
+  - id: meire-decoracoes
+    enabled: true
+    connection:
+      host: meire-decoracoes-postgres   # nome do container/serviço na network Docker compartilhada
+      port: 5432
+      user: postgres
+      password_env: MEIRE_PGPASSWORD
+      database: meire_banco
+    schedule: "0 3 * * *"
+    retention:
+      local_days: 7
+      remote_days: 30
+    destinations:
+      - name: r2-principal
+        type: r2
+        remote: r2-principal
+        bucket: meire-backups
+        prefix: meire-decoracoes/
+      - name: oci-arquivo-frio
+        type: oci_par
+        par_url_env: MEIRE_OCI_PAR_URL   # PAR "bucket-level" com permissão de escrita (e leitura, se quiser verify_upload)
+    webhook_url_env: MEIRE_WEBHOOK_URL   # opcional; se ausente usa DEFAULT_WEBHOOK_URL do .env
+
+  - id: outro-projeto
+    enabled: true
+    connection:
+      host: outro-projeto-postgres
+      port: 5432
+      user: postgres
+      password_env: OUTRO_PGPASSWORD
+      database: outro_banco
+    schedule: "30 2 * * *"
+    verify:
+      test_restore: true             # este projeto quer o restore de teste completo
+    destinations:
+      - name: s3-generico
+        type: s3
+        remote: s3-aws-generico
+        bucket: outro-bucket
+        prefix: outro-projeto/

@@ -1,0 +1,29 @@
+services:
+  pg-backup:
+    build: .
+    image: pg-multi-backup-tool:latest
+    container_name: pg-multi-backup-tool
+    restart: unless-stopped
+    # PID 1 vira o tini embutido do Docker; sem isso o cron roda como PID 1
+    # e alguns sinais/zumbis não são tratados corretamente.
+    init: true
+    environment:
+      TZ: America/Sao_Paulo
+      CONFIG_FILE: /app/config/databases.yml
+      BACKUP_DIR: /backups
+    env_file:
+      - .env
+    volumes:
+      - ./config/databases.yml:/app/config/databases.yml:ro
+      - ./backups:/backups
+    networks:
+      - padrao
+      # Se algum projeto usar uma network externa diferente da compartilhada
+      # "padrao", adicione-a aqui também e no bloco `networks:` abaixo.
+
+networks:
+  padrao:
+    external: true
+    # Ajuste "name" para o nome real da network Docker já usada pelos seus
+    # projetos (a mesma que cada compose de projeto declara como `external: true`).
+    name: padrao
