@@ -114,13 +114,29 @@ resolve_pg_env() {
     export PGPASSWORD
 }
 
-# upload_local <id> <destino-json> <arquivo> <arquivo-sha256-ou-vazio> <verificar:true|false>
+# local_md5_hex <arquivo> -> MD5 em hex minúsculo
+local_md5_hex() {
+    md5sum "$1" | awk '{print $1}'
+}
+
+# oci_par_remote_md5_hex <url-do-objeto-na-par>
+# HEAD na PAR e conversão do header "content-md5" (base64, como toda a family
+# de APIs de object storage retorna) pra hex, comparável a `md5sum`. Não baixa
+# o corpo do objeto — é só isso que faz esse checksum "custar zero rede extra".
+oci_par_remote_md5_hex() {
+    local url="$1" b64
+    b64=$(curl -sS -I "$url" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-md5"{print $2}')
+    [ -n "$b64" ] || return 1
+    echo "$b64" | base64 -d 2>/dev/null | od -An -tx1 | tr -d ' \n'
+}
+
+# upload_local <id> <destino-json> <arquivo> <arquivo-sha256-ou-vazio> <verificar-tamanho:true|false> <verificar-checksum:true|false>
 # Copia o dump (e o .sha256, se houver) para outro caminho dentro do próprio
 # container — útil para um segundo disco/NAS/mount montado à parte do
 # BACKUP_DIR de staging (que já tem sua própria retenção via retention.local_days,
 # independente disso). O "path" precisa estar montado como volume no compose.
 upload_local() {
-    local id="$1" dest="$2" filepath="$3" shafile="$4" verify="$5"
+    local id="$1" dest="$2" filepath="$3" shafile="$4" verify="$5" verify_checksum="${6:-false}"
     local name path fname
     name=$(echo "$dest" | jq -r '.name')
     path=$(echo "$dest" | jq -r '.path')
@@ -151,12 +167,22 @@ upload_local() {
         fi
         log "$id" "verificação de cópia OK em '${name}' (${local_size} bytes)"
     fi
+    if [ "$verify_checksum" = "true" ]; then
+        local local_md5 copied_md5
+        local_md5=$(local_md5_hex "$filepath")
+        copied_md5=$(local_md5_hex "${path}/${fname}")
+        if [ "$local_md5" != "$copied_md5" ]; then
+            log "$id" "ERRO: checksum não confere em '${name}' (origem=${local_md5} cópia=${copied_md5})"
+            return 1
+        fi
+        log "$id" "checksum OK em '${name}' (md5 ${local_md5})"
+    fi
     return 0
 }
 
-# upload_rclone <id> <destino-json> <arquivo> <arquivo-sha256-ou-vazio> <verificar:true|false>
+# upload_rclone <id> <destino-json> <arquivo> <arquivo-sha256-ou-vazio> <verificar-tamanho:true|false> <verificar-checksum:true|false>
 upload_rclone() {
-    local id="$1" dest="$2" filepath="$3" shafile="$4" verify="$5"
+    local id="$1" dest="$2" filepath="$3" shafile="$4" verify="$5" verify_checksum="${6:-false}"
     local name remote bucket prefix remote_path fname
     name=$(echo "$dest" | jq -r '.name')
     remote=$(echo "$dest" | jq -r '.remote')
@@ -185,14 +211,30 @@ upload_rclone() {
         fi
         log "$id" "verificação de upload OK em '${name}' (${local_size} bytes)"
     fi
+    if [ "$verify_checksum" = "true" ]; then
+        local local_md5 remote_md5
+        local_md5=$(local_md5_hex "$filepath")
+        # rclone hashsum lê o MD5 do ETag do backend via HEAD — não baixa o
+        # arquivo. Só é confiável pra uploads em uma parte só (sem multipart);
+        # se o backend não souber informar, retorna vazio e a gente só avisa.
+        remote_md5=$(rclone hashsum md5 "${remote_path}${fname}" --s3-no-check-bucket 2>/dev/null | awk '{print $1}')
+        if [ -z "$remote_md5" ]; then
+            log "$id" "aviso: '${name}' não retornou MD5 pra verificação de checksum (não é fatal)"
+        elif [ "$remote_md5" != "$local_md5" ]; then
+            log "$id" "ERRO: checksum não confere em '${name}' (local=${local_md5} remoto=${remote_md5})"
+            return 1
+        else
+            log "$id" "checksum OK em '${name}' (md5 ${local_md5}, sem re-baixar o arquivo)"
+        fi
+    fi
     return 0
 }
 
-# upload_oci_par <id> <destino-json> <arquivo> <arquivo-sha256-ou-vazio> <verificar:true|false>
+# upload_oci_par <id> <destino-json> <arquivo> <arquivo-sha256-ou-vazio> <verificar-tamanho:true|false> <verificar-checksum:true|false>
 # Espera um PAR "bucket-level" com permissão de escrita (ObjectReadWrite/AnyObjectWrite);
 # o nome do arquivo é anexado à URL do PAR.
 upload_oci_par() {
-    local id="$1" dest="$2" filepath="$3" shafile="$4" verify="$5"
+    local id="$1" dest="$2" filepath="$3" shafile="$4" verify="$5" verify_checksum="${6:-false}"
     local name var url fname http_code
     name=$(echo "$dest" | jq -r '.name')
     var=$(echo "$dest" | jq -r '.par_url_env')
@@ -221,6 +263,19 @@ upload_oci_par() {
             return 1
         fi
         log "$id" "verificação de upload OK em '${name}' (${local_size} bytes)"
+    fi
+    if [ "$verify_checksum" = "true" ]; then
+        local local_md5 remote_md5
+        local_md5=$(local_md5_hex "$filepath")
+        remote_md5=$(oci_par_remote_md5_hex "${url}/${fname}")
+        if [ -z "$remote_md5" ]; then
+            log "$id" "aviso: '${name}' não retornou content-md5 pra verificação de checksum (não é fatal)"
+        elif [ "$remote_md5" != "$local_md5" ]; then
+            log "$id" "ERRO: checksum não confere em '${name}' (local=${local_md5} remoto=${remote_md5})"
+            return 1
+        else
+            log "$id" "checksum OK em '${name}' (md5 ${local_md5}, sem re-baixar o arquivo)"
+        fi
     fi
     return 0
 }

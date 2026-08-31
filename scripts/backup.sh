@@ -16,6 +16,7 @@ FORMAT=$(db_get "$DB_ID" ".format" "custom")
 DO_STRUCT_CHECK=$(db_get "$DB_ID" ".verify.structural_check" "true")
 DO_CHECKSUM=$(db_get "$DB_ID" ".verify.checksum" "true")
 DO_VERIFY_UPLOAD=$(db_get "$DB_ID" ".verify.verify_upload" "true")
+DO_CHECKSUM_AFTER_UPLOAD=$(db_get "$DB_ID" ".verify.checksum_after_upload" "false")
 DO_TEST_RESTORE=$(db_get "$DB_ID" ".verify.test_restore" "false")
 
 WEBHOOK_VAR=$(db_get "$DB_ID" ".webhook_url_env" "")
@@ -64,13 +65,13 @@ while IFS= read -r dest; do
     TYPE=$(echo "$dest" | jq -r '.type')
     case "$TYPE" in
         s3|r2)
-            upload_rclone "$DB_ID" "$dest" "$FILEPATH" "$SHAFILE" "$DO_VERIFY_UPLOAD" || FAILED_DEST=1
+            upload_rclone "$DB_ID" "$dest" "$FILEPATH" "$SHAFILE" "$DO_VERIFY_UPLOAD" "$DO_CHECKSUM_AFTER_UPLOAD" || FAILED_DEST=1
             ;;
         oci_par)
-            upload_oci_par "$DB_ID" "$dest" "$FILEPATH" "$SHAFILE" "$DO_VERIFY_UPLOAD" || FAILED_DEST=1
+            upload_oci_par "$DB_ID" "$dest" "$FILEPATH" "$SHAFILE" "$DO_VERIFY_UPLOAD" "$DO_CHECKSUM_AFTER_UPLOAD" || FAILED_DEST=1
             ;;
         local)
-            upload_local "$DB_ID" "$dest" "$FILEPATH" "$SHAFILE" "$DO_VERIFY_UPLOAD" || FAILED_DEST=1
+            upload_local "$DB_ID" "$dest" "$FILEPATH" "$SHAFILE" "$DO_VERIFY_UPLOAD" "$DO_CHECKSUM_AFTER_UPLOAD" || FAILED_DEST=1
             ;;
         *)
             log "$DB_ID" "AVISO: tipo de destino desconhecido '${TYPE}', ignorando"

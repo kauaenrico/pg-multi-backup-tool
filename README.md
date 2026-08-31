@@ -117,6 +117,7 @@ do código" indicado abaixo.
 | `verify.structural_check` | boolean | `true` | `pg_restore --list` no dump logo após gerá-lo, antes do upload. |
 | `verify.checksum` | boolean | `true` | Gera `<arquivo>.sha256` e envia junto a cada destino. |
 | `verify.verify_upload` | boolean | `true` | Confere o tamanho do arquivo no destino logo após o envio. |
+| `verify.checksum_after_upload` | boolean | `false` | Confere um MD5 real do destino contra o local, sem re-baixar (lê `ETag`/`content-md5` via `HEAD`). Ver detalhes na seção "Verificações feitas em todo backup". |
 | `verify.test_restore` | boolean | `false` | Restore completo num banco descartável no mesmo servidor (`createdb`/`pg_restore`/`dropdb`). Exige `CREATEDB` no `connection.user`; mais caro, por isso opt-in. |
 
 **`remotes[]`** (raiz do YAML — remotes reutilizáveis do rclone, usados por destinos `type: s3`/`type: r2`)
@@ -231,7 +232,22 @@ Campos extras por `type`:
    junto a cada destino.
 3. **Verificação de upload** — após enviar, confere se o tamanho do objeto no
    destino bate com o tamanho local (via `rclone lsjson` ou `HEAD` na PAR).
-4. **Restore de teste (opt-in, `verify.test_restore: true`)** — cria um banco
+   Isso pega upload truncado/incompleto, mas é só tamanho — não é o mesmo que
+   conferir o conteúdo byte a byte.
+4. **Checksum pós-upload (opt-in, `verify.checksum_after_upload: true`)** —
+   confere um MD5 real do que ficou no destino contra o MD5 local, **sem
+   baixar o arquivo de novo**: em `s3`/`r2` lê o MD5 do header `ETag` que o
+   próprio backend já retorna num `HEAD` (via `rclone hashsum md5`); na OCI
+   lê o header `content-md5` (também via `HEAD` na PAR). Confirmado na prática
+   contra MinIO (S3) e um bucket OCI real: ambos retornam o hash sem
+   transferir o corpo do objeto. Único requisito pro `ETag` valer como MD5:
+   upload feito numa parte só (sem multipart) — que é sempre o caso pra dumps
+   de banco de dados dentro de tamanhos normais; se o backend não conseguir
+   informar o hash, o script só avisa e segue (não é fatal). Pra destino
+   `local` a comparação é direta (dois `md5sum` no mesmo disco). Desligado por
+   padrão porque, mesmo sem custo de rede, ainda é uma chamada HTTP a mais por
+   destino a cada backup.
+5. **Restore de teste (opt-in, `verify.test_restore: true`)** — cria um banco
    descartável no mesmo servidor (`createdb`), roda `pg_restore` nele de
    verdade e apaga em seguida (`dropdb`). Exige privilégio `CREATEDB` no
    usuário configurado; fica desligado por padrão porque é mais caro e usa

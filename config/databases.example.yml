@@ -13,6 +13,7 @@ defaults:
     structural_check: true        # pg_restore --list logo após o dump (rápido, pega dump corrompido)
     checksum: true                 # gera e envia um .sha256 junto com o dump
     verify_upload: true             # confere tamanho do arquivo no destino após o envio
+    checksum_after_upload: false     # opt-in: confere um MD5 real via ETag/content-md5 (sem re-baixar o arquivo)
     test_restore: false              # restore completo num banco descartável (exige CREATEDB); mais caro, opt-in
 
 # Remotes reutilizáveis do rclone (qualquer backend S3-compatível: AWS S3, Cloudflare
