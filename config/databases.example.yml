@@ -5,7 +5,7 @@
 
 defaults:
   schedule: "0 3 * * *"          # cron: todo dia às 03:00 (TZ do container)
-  format: custom                  # custom (pg_dump -Fc) | plain (-Fp) | directory (-Fd)
+  format: custom                  # custom (pg_dump -Fc) | plain (-Fp) — "directory" (-Fd) ainda não é suportado
   retention:
     local_days: 7                 # dias que o .dump fica no volume local /backups
     remote_days: 30                # dias até apagar do destino (só se aplica a s3/r2)
@@ -15,6 +15,14 @@ defaults:
     verify_upload: true             # confere tamanho do arquivo no destino após o envio
     checksum_after_upload: false     # opt-in: confere um MD5 real via ETag/content-md5 (sem re-baixar o arquivo)
     test_restore: false              # restore completo num banco descartável (exige CREATEDB); mais caro, opt-in
+  # Canais usados por qualquer banco que não definir o seu próprio `notifications:`
+  # (é tudo ou nada — um banco com `notifications:` próprio ignora esta lista
+  # inteira, não faz merge campo a campo). Sem `on:`, o default é só `failure`.
+  notifications:
+    - type: webhook
+      format: slack               # slack | discord | generic
+      url_env: DEFAULT_WEBHOOK_URL
+      on: [failure, warning]
 
 # Remotes reutilizáveis do rclone (qualquer backend S3-compatível: AWS S3, Cloudflare
 # R2, MinIO, Backblaze B2 via S3 API, etc.). Vários bancos podem apontar para o mesmo remote.
@@ -34,46 +42,101 @@ remotes:
     secret_access_key_env: AWS_SECRET_ACCESS_KEY
 
 databases:
-  - id: meire-decoracoes
-    enabled: true
+  # 1) MÍNIMO POSSÍVEL: só os campos obrigatórios, tudo o mais herda de
+  #    `defaults`. Um único destino na nuvem, SEM nenhuma cópia local extra
+  #    (só o staging temporário em /backups, que sempre existe).
+  - id: app-simples
     connection:
-      host: meire-decoracoes-postgres   # nome do container/serviço na network Docker compartilhada
-      port: 5432
-      user: postgres
-      password_env: MEIRE_PGPASSWORD
-      database: meire_banco
-    schedule: "0 3 * * *"
-    retention:
-      local_days: 7
-      remote_days: 30
+      host: app-simples-postgres   # nome do container/serviço na network Docker compartilhada
+      database: app_simples
+      password_env: APP_SIMPLES_PGPASSWORD
     destinations:
       - name: r2-principal
         type: r2
         remote: r2-principal
-        bucket: meire-backups
-        prefix: meire-decoracoes/
-      - name: oci-arquivo-frio
-        type: oci_par
-        par_url_env: MEIRE_OCI_PAR_URL   # PAR "bucket-level" com permissão de escrita (e leitura, se quiser verify_upload)
-      - name: disco-secundario
-        type: local
-        path: /mnt/backup-secundario/meire-decoracoes/   # precisa estar montado como volume no compose
-    webhook_url_env: MEIRE_WEBHOOK_URL   # opcional; se ausente usa DEFAULT_WEBHOOK_URL do .env
+        bucket: app-simples-backups
+        prefix: app-simples/
 
-  - id: outro-projeto
+  # 2) "CINTO E SUSPENSÓRIOS": todo campo sobrescrito, verificação máxima
+  #    (inclusive as duas opt-in: checksum_after_upload e test_restore), e
+  #    backup replicado nos QUATRO tipos de destino ao mesmo tempo
+  #    (S3 + R2 + OCI PAR + disco local) — pro banco mais crítico do fluxo.
+  - id: app-critico
     enabled: true
+    schedule: "15 2 * * *"          # horário diferente de app-simples, de propósito (evita disparo simultâneo)
+    format: custom
     connection:
-      host: outro-projeto-postgres
+      host: app-critico-postgres
       port: 5432
       user: postgres
-      password_env: OUTRO_PGPASSWORD
-      database: outro_banco
-    schedule: "30 2 * * *"
+      database: app_critico
+      password_env: APP_CRITICO_PGPASSWORD
+    retention:
+      local_days: 14
+      remote_days: 90
     verify:
-      test_restore: true             # este projeto quer o restore de teste completo
+      structural_check: true
+      checksum: true
+      verify_upload: true
+      checksum_after_upload: true    # confere MD5 real via ETag/content-md5 em cada destino
+      test_restore: true              # restore de teste completo a cada backup (exige CREATEDB)
     destinations:
-      - name: s3-generico
+      - name: s3-principal
         type: s3
         remote: s3-aws-generico
-        bucket: outro-bucket
-        prefix: outro-projeto/
+        bucket: app-critico-backups-primario
+        prefix: app-critico/
+      - name: r2-secundario
+        type: r2
+        remote: r2-principal
+        bucket: app-critico-backups-secundario
+        prefix: app-critico/
+      - name: oci-arquivo-frio
+        type: oci_par
+        par_url_env: APP_CRITICO_OCI_PAR_URL   # PAR "bucket-level" com leitura+escrita (+ delete, se quiser retenção automática)
+      - name: disco-secundario
+        type: local
+        path: /mnt/backup-secundario/app-critico/   # precisa estar montado como volume no compose
+    # Sobrescreve os canais de `defaults` inteiramente: aqui quer aviso de
+    # TUDO (inclusive sucesso e o início do backup), em 3 canais diferentes.
+    notifications:
+      - type: telegram
+        name: telegram-oncall
+        bot_token_env: APP_CRITICO_TELEGRAM_BOT_TOKEN
+        chat_id_env: APP_CRITICO_TELEGRAM_CHAT_ID
+        on: [start, success, warning, failure]
+      - type: email
+        smtp_host_env: SMTP_HOST
+        smtp_port_env: SMTP_PORT          # opcional, default 587 (STARTTLS)
+        smtp_user_env: SMTP_USER
+        smtp_password_env: SMTP_PASSWORD
+        from_env: SMTP_FROM
+        to_env: APP_CRITICO_EMAIL_TO       # pode reusar as mesmas SMTP_* de outro banco e só trocar o destinatário
+        on: [failure, warning]
+      - type: webhook
+        format: discord
+        url_env: APP_CRITICO_DISCORD_WEBHOOK_URL
+        on: [failure]
+
+  # 3) PROJETO PAUSADO/LEGADO: enabled: false tira do crontab automático, mas
+  #    a configuração continua aqui pra rodar `backup.sh app-legado` na mão
+  #    quando precisar. format: plain gera SQL puro (sem checagem estrutural,
+  #    que só existe pra formato custom). Único destino, e é do tipo "local"
+  #    — o oposto do exemplo 1 (que não tinha nenhum "local"). Notificação
+  #    mínima: só um ntfy avisando falha, já que ninguém acompanha de perto.
+  - id: app-legado
+    enabled: false
+    format: plain
+    connection:
+      host: app-legado-postgres
+      database: app_legado
+      password_env: APP_LEGADO_PGPASSWORD
+    destinations:
+      - name: disco-secundario
+        type: local
+        path: /mnt/backup-secundario/app-legado/
+    notifications:
+      - type: ntfy
+        url_env: APP_LEGADO_NTFY_URL   # ex.: https://ntfy.sh/meu-topico-privado
+        priority: default                # min | low | default | high | urgent
+        on: [failure]

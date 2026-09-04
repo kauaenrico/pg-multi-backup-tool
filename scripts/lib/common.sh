@@ -10,23 +10,150 @@ log() {
     echo "[${id}] $(date -Iseconds) $*"
 }
 
-# Envia uma notificação via webhook (Slack por padrão; WEBHOOK_FORMAT=discord
-# troca a chave do JSON de "text" para "content"). Nunca falha o chamador.
-send_webhook() {
-    local url="$1" msg="$2"
-    [ -n "$url" ] || return 0
-    local body
-    case "${WEBHOOK_FORMAT:-slack}" in
-        discord) body=$(jq -cn --arg c "$msg" '{content:$c}') ;;
-        *)       body=$(jq -cn --arg t "$msg" '{text:$t}') ;;
+# db_notifications_json <id>
+# Lista de canais de notificação (um JSON compacto por linha) do banco <id>;
+# se o banco não define `notifications:`, cai inteiro para `defaults.notifications`
+# (é tudo ou nada, sem merge campo a campo — mesmo espírito de `destinations:`).
+db_notifications_json() {
+    local id="$1" result
+    result=$(DB_ID="$id" yq e -o=json "(.databases[] | select(.id == strenv(DB_ID)) | .notifications)" "$CONFIG_FILE" 2>/dev/null)
+    if [ -z "$result" ] || [ "$result" = "null" ]; then
+        result=$(yq e -o=json '.defaults.notifications' "$CONFIG_FILE" 2>/dev/null)
+    fi
+    [ -n "$result" ] && [ "$result" != "null" ] || return 0
+    echo "$result" | jq -c '.[]'
+}
+
+# notify <id> <evento:start|success|warning|failure> <mensagem>
+# Dispara a mensagem em todo canal configurado cujo `on:` inclua o evento.
+# Sem `on:` no canal, o default é só "failure" (silencioso no resto). Nunca
+# derruba o chamador — problema de notificação não pode virar falha de backup.
+notify() {
+    local id="$1" event="$2" message="$3" chan on_csv type name
+    while IFS= read -r chan; do
+        [ -z "$chan" ] && continue
+        on_csv=$(echo "$chan" | jq -r '(.on // ["failure"]) | join(",")')
+        case ",${on_csv}," in
+            *",${event},"*) ;;
+            *) continue ;;
+        esac
+        type=$(echo "$chan" | jq -r '.type')
+        name=$(echo "$chan" | jq -r '.name // .type')
+        case "$type" in
+            webhook)  notify_webhook  "$id" "$name" "$chan" "$event" "$message" ;;
+            telegram) notify_telegram "$id" "$name" "$chan" "$event" "$message" ;;
+            email)    notify_email    "$id" "$name" "$chan" "$event" "$message" ;;
+            ntfy)     notify_ntfy     "$id" "$name" "$chan" "$event" "$message" ;;
+            *) log "$id" "aviso: tipo de notificação desconhecido '${type}' em '${name}'" ;;
+        esac
+    done < <(db_notifications_json "$id")
+}
+
+# emoji_for <evento> -> prefixo usado nos canais de texto livre (webhook/telegram/ntfy)
+emoji_for() {
+    case "$1" in
+        start)   echo "▶️" ;;
+        success) echo "✅" ;;
+        warning) echo "⚠️" ;;
+        *)       echo "❌" ;;
     esac
-    curl -fsS -m 10 -X POST -H "Content-Type: application/json" -d "$body" "$url" >/dev/null 2>&1 || true
+}
+
+notify_webhook() {
+    local id="$1" name="$2" chan="$3" event="$4" message="$5"
+    local url_var url format body emoji
+    url_var=$(echo "$chan" | jq -r '.url_env')
+    url="${!url_var:-}"
+    [ -n "$url" ] || { log "$id" "aviso: variável '${url_var}' (webhook '${name}') não definida"; return; }
+    format=$(echo "$chan" | jq -r '.format // "generic"')
+    emoji=$(emoji_for "$event")
+    case "$format" in
+        discord) body=$(jq -cn --arg c "${emoji} [${id}] ${message}" '{content:$c}') ;;
+        *)       body=$(jq -cn --arg t "${emoji} [${id}] ${message}" '{text:$t}') ;;
+    esac
+    curl -fsS -m 10 -X POST -H "Content-Type: application/json" -d "$body" "$url" >/dev/null 2>&1 \
+        || log "$id" "aviso: falha ao enviar notificação via webhook '${name}'"
+}
+
+notify_telegram() {
+    local id="$1" name="$2" chan="$3" event="$4" message="$5"
+    local token_var chatid_var token chatid emoji
+    token_var=$(echo "$chan" | jq -r '.bot_token_env')
+    chatid_var=$(echo "$chan" | jq -r '.chat_id_env')
+    token="${!token_var:-}"
+    chatid="${!chatid_var:-}"
+    [ -n "$token" ] && [ -n "$chatid" ] || { log "$id" "aviso: token/chat_id ausentes pro Telegram '${name}'"; return; }
+    emoji=$(emoji_for "$event")
+    curl -fsS -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+        --data-urlencode "chat_id=${chatid}" \
+        --data-urlencode "text=${emoji} [${id}] ${message}" \
+        >/dev/null 2>&1 \
+        || log "$id" "aviso: falha ao enviar notificação via Telegram '${name}'"
+}
+
+notify_ntfy() {
+    local id="$1" name="$2" chan="$3" event="$4" message="$5"
+    local url_var url priority emoji
+    url_var=$(echo "$chan" | jq -r '.url_env')
+    url="${!url_var:-}"
+    [ -n "$url" ] || { log "$id" "aviso: variável '${url_var}' (ntfy '${name}') não definida"; return; }
+    priority=$(echo "$chan" | jq -r '.priority // "default"')
+    emoji=$(emoji_for "$event")
+    curl -fsS -m 10 \
+        -H "Title: pg-multi-backup-tool: ${id}" \
+        -H "Priority: ${priority}" \
+        -d "${emoji} ${message}" \
+        "$url" >/dev/null 2>&1 \
+        || log "$id" "aviso: falha ao enviar notificação via ntfy '${name}'"
+}
+
+# notify_email — via msmtp (SMTP genérico: Gmail, SES, Mailgun, servidor próprio etc.).
+# A senha nunca aparece na linha de comando/`ps aux`: exportamos MSMTP_PW só pro
+# processo do msmtp e passamos `--passwordeval` com aspas simples, então
+# `$MSMTP_PW` só é expandido pelo sh interno do msmtp, lendo do ambiente dele
+# — igual ao PGPASSWORD do pg_dump, nunca vira argumento de linha de comando.
+notify_email() {
+    local id="$1" name="$2" chan="$3" event="$4" message="$5"
+    local host_var port_var user_var pass_var from_var to_var
+    local host port user pass from to subject emoji
+    host_var=$(echo "$chan" | jq -r '.smtp_host_env')
+    port_var=$(echo "$chan" | jq -r '.smtp_port_env // ""')
+    user_var=$(echo "$chan" | jq -r '.smtp_user_env')
+    pass_var=$(echo "$chan" | jq -r '.smtp_password_env')
+    from_var=$(echo "$chan" | jq -r '.from_env')
+    to_var=$(echo "$chan" | jq -r '.to_env')
+    host="${!host_var:-}"
+    port=587
+    [ -n "$port_var" ] && port="${!port_var:-587}"
+    user="${!user_var:-}"
+    pass="${!pass_var:-}"
+    from="${!from_var:-}"
+    to="${!to_var:-}"
+    [ -n "$host" ] && [ -n "$user" ] && [ -n "$pass" ] && [ -n "$from" ] && [ -n "$to" ] \
+        || { log "$id" "aviso: configuração SMTP incompleta pro e-mail '${name}'"; return; }
+
+    emoji=$(emoji_for "$event")
+    subject="${emoji} pg-multi-backup-tool [${id}] ${event}"
+
+    export MSMTP_PW="$pass"
+    {
+        echo "From: ${from}"
+        echo "To: ${to}"
+        echo "Subject: ${subject}"
+        echo
+        echo "${message}"
+    } | msmtp --host="$host" --port="$port" --auth=on --user="$user" \
+              --passwordeval='echo "$MSMTP_PW"' \
+              --tls=on --tls-starttls=on --from="$from" -- "$to" 2>/tmp/msmtp-error.log
+    local rc=$?
+    unset MSMTP_PW
+    [ $rc -eq 0 ] || log "$id" "aviso: falha ao enviar e-mail '${name}' (veja /tmp/msmtp-error.log)"
 }
 
 fail_db() {
-    local id="$1" msg="$2" webhook="${3:-}"
+    local id="$1" msg="$2"
     log "$id" "ERRO: $msg"
-    send_webhook "$webhook" "❌ [${id}] backup FALHOU: ${msg}"
+    notify "$id" failure "backup FALHOU: ${msg}"
     exit 1
 }
 
@@ -293,20 +420,22 @@ oci_par_list_names() {
     curl -sS "${url%/}/" 2>/dev/null | jq -r '.objects[]?.name // empty' 2>/dev/null
 }
 
-# apply_remote_retention <id>
+# apply_remote_retention <id> -> 0 se tudo OK, 1 se alguma retenção falhou
+# (não fatal para o backup em si — o chamador decide se isso vira um aviso).
 apply_remote_retention() {
-    local id="$1" remote_days
+    local id="$1" remote_days failed=0
     remote_days=$(db_get "$id" ".retention.remote_days" "30")
     while IFS= read -r dest; do
         [ -z "$dest" ] && continue
         local type
         type=$(echo "$dest" | jq -r '.type')
         case "$type" in
-            s3|r2) apply_rclone_retention "$id" "$dest" "$remote_days" ;;
-            oci_par) apply_oci_par_retention "$id" "$dest" "$remote_days" ;;
+            s3|r2) apply_rclone_retention "$id" "$dest" "$remote_days" || failed=1 ;;
+            oci_par) apply_oci_par_retention "$id" "$dest" "$remote_days" || failed=1 ;;
             local) apply_local_dest_retention "$id" "$dest" "$remote_days" ;;
         esac
     done < <(db_destinations_json "$id")
+    [ "$failed" = "0" ]
 }
 
 # apply_local_dest_retention <id> <destino-json> <dias>
@@ -328,8 +457,11 @@ apply_rclone_retention() {
     bucket=$(echo "$dest" | jq -r '.bucket')
     prefix=$(echo "$dest" | jq -r '.prefix // ""')
     remote_path="${remote}:${bucket}/${prefix}"
-    rclone delete "$remote_path" --min-age "${remote_days}d" --s3-no-check-bucket --include "${id}_*" \
-        || log "$id" "aviso: falha ao aplicar retenção remota em '${name}' (não é fatal)"
+    if ! rclone delete "$remote_path" --min-age "${remote_days}d" --s3-no-check-bucket --include "${id}_*"; then
+        log "$id" "aviso: falha ao aplicar retenção remota em '${name}' (não é fatal)"
+        return 1
+    fi
+    return 0
 }
 
 # apply_oci_par_retention <id> <destino-json> <dias>
@@ -340,15 +472,17 @@ apply_rclone_retention() {
 # falha de remoção vira só um aviso, igual ao comportamento já existente para
 # falhas de retenção em s3/r2.
 apply_oci_par_retention() {
-    local id="$1" dest="$2" remote_days="$3" name var url now_epoch
+    local id="$1" dest="$2" remote_days="$3" name var url now_epoch failed=0
     name=$(echo "$dest" | jq -r '.name')
     var=$(echo "$dest" | jq -r '.par_url_env')
     url="${!var:-}"
-    [ -n "$url" ] || { log "$id" "aviso: variável '${var}' (PAR) não definida, pulando retenção remota em '${name}'"; return; }
+    [ -n "$url" ] || { log "$id" "aviso: variável '${var}' (PAR) não definida, pulando retenção remota em '${name}'"; return 1; }
     url="${url%/}"
     now_epoch=$(date +%s)
 
-    oci_par_list_names "$url" | grep -E "^${id}_[0-9]{4}-[0-9]{2}-[0-9]{2}_" | while IFS= read -r objname; do
+    # process substitution (não pipe) de propósito: o loop precisa rodar no
+    # shell atual, não numa subshell, pra "failed" sobreviver até o "return".
+    while IFS= read -r objname; do
         local datepart file_epoch age_days http_code
         datepart=$(echo "$objname" | sed -E "s/^${id}_([0-9]{4}-[0-9]{2}-[0-9]{2})_.*/\1/")
         file_epoch=$(date -d "$datepart" +%s 2>/dev/null) || continue
@@ -359,8 +493,10 @@ apply_oci_par_retention() {
             log "$id" "removido backup remoto antigo em '${name}': ${objname}"
         else
             log "$id" "aviso: não foi possível remover '${objname}' em '${name}' (HTTP ${http_code}; a PAR pode não ter permissão de delete) — não é fatal"
+            failed=1
         fi
-    done
+    done < <(oci_par_list_names "$url" | grep -E "^${id}_[0-9]{4}-[0-9]{2}-[0-9]{2}_")
+    [ "$failed" = "0" ]
 }
 
 # run_test_restore <id> <arquivo>

@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cron \
         curl \
         jq \
+        msmtp \
         tzdata \
         unzip \
     && rm -rf /var/lib/apt/lists/*
