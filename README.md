@@ -273,7 +273,7 @@ Campos extras por `type` (ver seção "Notificações" para detalhes de cada can
 | `email` | `smtp_user` | Sim | Usuário SMTP. |
 | `email` | `smtp_password` | Sim | Senha SMTP, em texto puro. |
 | `email` | `from` | Sim | Remetente (`From:`). |
-| `email` | `to` | Sim | Destinatário(s). |
+| `email` | `to` | Sim | Destinatário(s) — um ou vários, separados por vírgula (`"a@x.com, b@x.com"`). Testado ponta a ponta com 2 destinatários: o servidor recebeu dois `RCPT TO` distintos, não uma string quebrada. |
 | `ntfy` | `url` | Sim | URL completa do tópico (ex.: `https://ntfy.sh/meu-topico`). |
 | `ntfy` | `priority` | Não | `min`\|`low`\|`default`\|`high`\|`urgent`. |
 

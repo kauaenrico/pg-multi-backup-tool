@@ -8,6 +8,74 @@
 # ele que guarda os segredos agora, não um .env separado. Recomendado rodar
 # `chmod 600 config/databases.yml` no host, já que ele carrega credenciais
 # em texto puro.
+#
+# ------------------------------------------------------------------------
+# REFERÊNCIA RÁPIDA — todo campo que existe, por seção. "*" = obrigatório.
+# Detalhes/exemplos de cada um estão nos 3 bancos abaixo e no README.md.
+# ------------------------------------------------------------------------
+#
+# databases[]:
+#   id*             identificador único (usado em backup.sh/restore.sh/resend.sh/verify.sh <id>)
+#   enabled         true|false                         default: true
+#   schedule        cron de 5 campos                   default: "0 3 * * *"
+#   format          custom|plain                       default: custom  ("directory" não é suportado)
+#   connection*:
+#     host*, database*, password*
+#     port          default: 5432
+#     user          default: postgres
+#   retention:
+#     local_days    dias no staging /backups           default: 7
+#     remote_days   dias em cada destino                default: 30
+#   verify:
+#     structural_check        default: true
+#     checksum                 default: true
+#     verify_upload             default: true
+#     checksum_after_upload      default: false  (opt-in)
+#     test_restore                default: false  (opt-in, exige CREATEDB)
+#   destinations*:  (lista, pelo menos 1 item)
+#     name*, type*: s3|r2|oci_par|local
+#     # type: s3 ou r2
+#       access_key_id*, secret_access_key*, bucket*
+#       provider, region, endpoint, prefix
+#     # type: oci_par
+#       par_url*
+#     # type: local
+#       path*
+#   notifications:  (lista, opcional — sem ela, esse banco não notifica nada)
+#     name          só rótulo nos logs                  default: o próprio "type"
+#     on            [start, success, warning, failure]  default: [failure]
+#     type*: webhook|telegram|email|ntfy
+#     # type: webhook
+#       url*
+#       format: slack|discord|generic                   default: slack
+#     # type: telegram
+#       bot_token*, chat_id*
+#     # type: email
+#       smtp_host*, smtp_user*, smtp_password*, from*, to*
+#       smtp_port                                        default: 587 (STARTTLS)
+#     # type: ntfy
+#       url*
+#       priority: min|low|default|high|urgent
+# ------------------------------------------------------------------------
+#
+# EXEMPLOS PRONTOS DE NOTIFICAÇÃO — cole o bloco do tipo que quiser dentro de
+# `notifications:` de qualquer banco (troque os valores de exemplo pelos reais):
+#
+#   - type: telegram
+#     name: telegram-oncall
+#     bot_token: "123456789:AAAbotTokenDeExemploAqui"   # via @BotFather (t.me/BotFather)
+#     chat_id: "-1001234567890"                          # ID do usuário/grupo/canal que recebe
+#     on: [failure, warning]
+#
+#   - type: email
+#     smtp_host: smtp.seuservidor.com
+#     smtp_port: 587                       # opcional, default 587 (STARTTLS)
+#     smtp_user: "backups@seudominio.com"
+#     smtp_password: "SUA_SENHA_SMTP"
+#     from: "backups@seudominio.com"
+#     to: "oncall@seudominio.com"           # pode ser mais de um endereço, separado por vírgula
+#     on: [failure, warning]
+# ------------------------------------------------------------------------
 
 databases:
   # 1) MÍNIMO POSSÍVEL — só os campos realmente obrigatórios; o resto usa o

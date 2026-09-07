@@ -121,6 +121,19 @@ notify_email() {
     [ -n "$host" ] && [ -n "$user" ] && [ -n "$pass" ] && [ -n "$from" ] && [ -n "$to" ] \
         || { log "$id" "aviso: configuração SMTP incompleta pro e-mail '${name}'"; return; }
 
+    # "to" aceita vários endereços separados por vírgula (ex.: "a@x.com, b@x.com").
+    # msmtp exige cada destinatário como argumento separado na linha de comando
+    # (não entende uma string só com vírgulas), por isso o split manual aqui.
+    local to_args=() part
+    local old_ifs="$IFS"
+    IFS=','
+    for part in $to; do
+        part="${part// /}"
+        [ -n "$part" ] && to_args+=("$part")
+    done
+    IFS="$old_ifs"
+    [ "${#to_args[@]}" -gt 0 ] || { log "$id" "aviso: 'to' inválido pro e-mail '${name}'"; return; }
+
     emoji=$(emoji_for "$event")
     subject="${emoji} pg-multi-backup-tool [${id}] ${event}"
 
@@ -133,7 +146,7 @@ notify_email() {
         echo "${message}"
     } | msmtp --host="$host" --port="$port" --auth=on --user="$user" \
               --passwordeval='echo "$MSMTP_PW"' \
-              --tls=on --tls-starttls=on --from="$from" -- "$to" 2>/tmp/msmtp-error.log
+              --tls=on --tls-starttls=on --from="$from" -- "${to_args[@]}" 2>/tmp/msmtp-error.log
     local rc=$?
     unset MSMTP_PW
     [ $rc -eq 0 ] || log "$id" "aviso: falha ao enviar e-mail '${name}' (veja /tmp/msmtp-error.log)"
