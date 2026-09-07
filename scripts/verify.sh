@@ -11,6 +11,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB_ID="${1:?uso: verify.sh <id> --file <caminho> [--test-restore]}"
 shift
 require_db_exists "$DB_ID"
+start_logging "$DB_ID"
 
 FILEPATH=""
 DO_TEST_RESTORE="false"

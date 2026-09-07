@@ -2,13 +2,17 @@
 # Restaura o backup de UM banco configurado em databases.yml.
 #
 # Uso:
-#   restore.sh <id> local  <caminho-do-arquivo.dump>
+#   restore.sh <id> local  <arquivo.dump|/caminho/completo.dump>
 #   restore.sh <id> latest [nome-do-destino]
 #   restore.sh <id> remote <nome-do-destino> <nome-do-arquivo>
 #
 # Sem [nome-do-destino], usa o primeiro destino configurado para o banco.
 # Destinos do tipo oci_par não suportam "latest" (PAR não permite listar
 # objetos do bucket) — use "remote <destino> <arquivo>" com o nome exato.
+#
+# Cada banco fica em BACKUP_DIR/<id>/ (não misturado com o de outros bancos).
+# No modo "local", um caminho absoluto é usado como está; um nome de arquivo
+# sem "/" é procurado dentro de BACKUP_DIR/<id>/.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,9 +21,12 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB_ID="${1:?uso: restore.sh <id> [local <arquivo> | latest [destino] | remote <destino> <arquivo>]}"
 MODE="${2:-}"
 require_db_exists "$DB_ID"
+start_logging "$DB_ID"
 resolve_pg_env "$DB_ID" || exit 1
 
-mkdir -p "$BACKUP_DIR"
+# Cada banco tem sua própria subpasta em BACKUP_DIR (ver backup.sh).
+DB_BACKUP_DIR="${BACKUP_DIR}/${DB_ID}"
+mkdir -p "$DB_BACKUP_DIR"
 FILEPATH=""
 
 first_destination_name() {
@@ -38,25 +45,25 @@ download_from_destination() {
             remote_str=$(rclone_remote_string "$dest")
             remote_path="${remote_str}${bucket}/${prefix}"
             echo "[restore] baixando '${fname}' de '${dest_name}' (bucket ${bucket}/${prefix})"
-            rclone copy "${remote_path}${fname}" "$BACKUP_DIR" --s3-no-check-bucket \
+            rclone copy "${remote_path}${fname}" "$DB_BACKUP_DIR" --s3-no-check-bucket \
                 || { echo "[restore] ERRO: download falhou"; exit 1; }
-            rclone copy "${remote_path}${fname}.sha256" "$BACKUP_DIR" --s3-no-check-bucket 2>/dev/null || true
+            rclone copy "${remote_path}${fname}.sha256" "$DB_BACKUP_DIR" --s3-no-check-bucket 2>/dev/null || true
             ;;
         oci_par)
             url=$(echo "$dest" | jq -r '.par_url // ""')
             [ -n "$url" ] || { echo "[restore] ERRO: destino '${dest_name}' sem 'par_url' configurada"; exit 1; }
             url="${url%/}"
             echo "[restore] baixando '${fname}' de '${dest_name}' (OCI PAR)"
-            curl -fsS -o "${BACKUP_DIR}/${fname}" "${url}/${fname}" \
+            curl -fsS -o "${DB_BACKUP_DIR}/${fname}" "${url}/${fname}" \
                 || { echo "[restore] ERRO: download falhou (a PAR precisa permitir leitura)"; exit 1; }
-            curl -fsS -o "${BACKUP_DIR}/${fname}.sha256" "${url}/${fname}.sha256" 2>/dev/null || true
+            curl -fsS -o "${DB_BACKUP_DIR}/${fname}.sha256" "${url}/${fname}.sha256" 2>/dev/null || true
             ;;
         local)
             dest_path=$(echo "$dest" | jq -r '.path')
             echo "[restore] copiando '${fname}' de '${dest_name}' (local: ${dest_path})"
-            cp "${dest_path}/${fname}" "$BACKUP_DIR/" \
+            cp "${dest_path}/${fname}" "$DB_BACKUP_DIR/" \
                 || { echo "[restore] ERRO: cópia falhou (arquivo não encontrado em ${dest_path})"; exit 1; }
-            cp "${dest_path}/${fname}.sha256" "$BACKUP_DIR/" 2>/dev/null || true
+            cp "${dest_path}/${fname}.sha256" "$DB_BACKUP_DIR/" 2>/dev/null || true
             ;;
         *)
             echo "[restore] ERRO: tipo de destino desconhecido '${type}'"; exit 1 ;;
@@ -65,7 +72,11 @@ download_from_destination() {
 
 case "$MODE" in
     local)
-        FILEPATH="${3:?informe o caminho do arquivo: restore.sh $DB_ID local <arquivo.dump>}"
+        ARQ="${3:?informe o caminho do arquivo: restore.sh $DB_ID local <arquivo.dump>}"
+        case "$ARQ" in
+            /*) FILEPATH="$ARQ" ;;
+            *)  FILEPATH="${DB_BACKUP_DIR}/${ARQ}" ;;
+        esac
         [ -f "$FILEPATH" ] || { echo "[restore] ERRO: arquivo não encontrado: $FILEPATH" >&2; exit 1; }
         ;;
     latest)
@@ -103,13 +114,13 @@ case "$MODE" in
         esac
         [ -n "$LATEST" ] || { echo "[restore] ERRO: nenhum backup encontrado em '${DEST_NAME}'" >&2; exit 1; }
         download_from_destination "$DEST_NAME" "$LATEST"
-        FILEPATH="${BACKUP_DIR}/${LATEST}"
+        FILEPATH="${DB_BACKUP_DIR}/${LATEST}"
         ;;
     remote)
         DEST_NAME="${3:?informe o destino: restore.sh $DB_ID remote <destino> <arquivo>}"
         FNAME="${4:?informe o nome do arquivo: restore.sh $DB_ID remote <destino> <arquivo>}"
         download_from_destination "$DEST_NAME" "$FNAME"
-        FILEPATH="${BACKUP_DIR}/${FNAME}"
+        FILEPATH="${DB_BACKUP_DIR}/${FNAME}"
         ;;
     *)
         echo "uso: restore.sh <id> [local <arquivo> | latest [destino] | remote <destino> <arquivo>]" >&2

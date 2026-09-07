@@ -15,6 +15,10 @@ dentro de cada projeto.
   servidores Postgres mais antigos sem precisar de uma imagem por versão.
 - O container entra na(s) mesma(s) network(s) Docker que os projetos já usam
   e conecta em cada Postgres pelo nome do container/serviço (`host:porta`).
+- O dump de cada banco fica em `BACKUP_DIR/<id>/` — uma subpasta por banco,
+  nunca misturado com o de outro (`./backups/app-simples/`,
+  `./backups/app-critico/`, ...). `restore.sh`/`resend.sh` já resolvem nomes
+  de arquivo relativos dentro da subpasta certa sozinhos.
 - Toda a configuração fica em **um único arquivo YAML**
   (`config/databases.yml`), e **cada banco é 100% independente** — sem seção
   compartilhada tipo "defaults", sem remote nomeado reutilizado entre bancos.
@@ -41,6 +45,10 @@ dentro de cada projeto.
 - Notificações são configuráveis por evento (início, sucesso, aviso, falha) e
   por canal (webhook Slack/Discord/genérico, Telegram, e-mail via SMTP, ntfy)
   — ver seção "Notificações" abaixo.
+- Todo `backup.sh`/`resend.sh`/`restore.sh`/`verify.sh` grava sua própria saída
+  em `LOG_DIR/<id>.log` — via cron **ou** rodado na mão, sempre no mesmo
+  arquivo, persistido fora do container e rotacionado automaticamente. Ver
+  seção "Logs" abaixo.
 
 ## Estrutura
 
@@ -54,9 +62,11 @@ scripts/
   restore.sh <id> ...         # baixa e restaura um backup
   verify.sh <id> ...           # checagem avulsa de um arquivo já baixado
   list.sh                       # lista os bancos configurados
+  logs.sh <id> ...               # consulta o log persistido/rotacionado de um banco
   lib/
-    common.sh                   # funções compartilhadas
+    common.sh                   # funções compartilhadas (inclui start_logging)
     render-crontab.sh            # gera o crontab a partir de `databases:`
+    render-logrotate.sh           # gera /etc/logrotate.d/pg-backup a partir de LOG_DIR
 Dockerfile
 docker-compose.yml
 ```
@@ -208,7 +218,7 @@ compartilhada.
 | `schedule` | string (cron, 5 campos) | Não | `0 3 * * *` | Horário do backup. **Bancos com o mesmo `schedule` disparam em paralelo** (o `cron` não enfileira) — se tiver muitos bancos, considere escalonar os horários (`03:00`, `03:10`, `03:20`...) pra não competir por CPU/rede no mesmo instante. |
 | `format` | `custom` \| `plain` | Não | `custom` | Formato do `pg_dump` (`-Fc`/`-Fp`). Com `plain` a checagem estrutural é pulada (`pg_restore --list` não existe pra SQL puro). **`directory` (`-Fd`) não é suportado ainda** — testado e confirmado quebrado: gera múltiplos arquivos numa pasta, e checksum/upload/verificação/retenção assumem hoje "um dump = um arquivo só" em todo o pipeline; `backup.sh` recusa esse valor de propósito, com erro claro. |
 | `connection` | objeto | Sim | — | Ver tabela abaixo. |
-| `retention.local_days` | inteiro | Não | `7` | Dias que o dump fica no `BACKUP_DIR` de staging (`/backups`) antes de ser apagado. |
+| `retention.local_days` | inteiro | Não | `7` | Dias que o dump fica no `BACKUP_DIR` de staging (`/backups/<id>/`) antes de ser apagado. |
 | `retention.remote_days` | inteiro | Não | `30` | Dias até apagar de **cada** destino em `destinations:` — vale para `s3`, `r2`, `oci_par` (se a PAR permitir delete) e `local`. |
 | `verify.structural_check` | boolean | Não | `true` | `pg_restore --list` no dump logo após gerá-lo, antes do upload. |
 | `verify.checksum` | boolean | Não | `true` | Gera `<arquivo>.sha256` e envia junto a cada destino. |
@@ -283,6 +293,7 @@ Campos extras por `type` (ver seção "Notificações" para detalhes de cada can
 |---|---|---|
 | `CONFIG_FILE` | `/app/config/databases.yml` | Caminho do YAML dentro do container. |
 | `BACKUP_DIR` | `/backups` | Diretório de staging dos dumps. |
+| `LOG_DIR` | `/var/log/pg-backup` | Onde `backup.sh`/`resend.sh`/`restore.sh`/`verify.sh` gravam `<id>.log` (ver seção "Logs"). |
 | `TZ` | `America/Sao_Paulo` | Timezone usado pelo `cron` para interpretar os `schedule`. |
 
 ### Tipos de destino suportados hoje
@@ -377,12 +388,54 @@ bancos configurados.
   você hospede sua própria instância com autenticação) — escolha um nome
   longo e não-óbvio, tipo `pg-backup-<algo-aleatorio>`.
 
+## Logs
+
+Antes disso, o log de cada job do cron ficava só dentro da camada gravável do
+container — sem volume, sumia toda vez que o container era recriado
+(`docker compose down`/`up`, `--force-recreate`, `--build` trocando a
+imagem), e uma execução manual via `docker compose exec` não deixava rastro
+nenhum além do que apareceu na hora no terminal.
+
+Agora `backup.sh`, `resend.sh`, `restore.sh` e `verify.sh` espelham *toda* a
+própria saída — logs formatados, e também qualquer erro cru de `pg_dump`/
+`rclone`/`curl` — em `LOG_DIR/<id>.log`, **seja a execução via cron ou
+manual, sempre no mesmo arquivo**. Testado de ponta a ponta: uma execução
+manual apareceu no arquivo persistido no host; um disparo real do cron,
+também; os dois ficaram no mesmo arquivo, em ordem cronológica.
+
+- **Persistência**: `LOG_DIR` (`/var/log/pg-backup` por padrão) é montado
+  como volume no `docker-compose.yml` (`./logs:/var/log/pg-backup`) — sobrevive
+  a qualquer recriação do container.
+- **Rotação**: `logrotate` roda diariamente via cron (linha fixa gerada pelo
+  `entrypoint.sh`, não depende de `databases:`), mantendo **14 dias** por
+  banco, comprimidos a partir do segundo dia (`<id>.log`, `<id>.log.1`,
+  `<id>.log.2.gz`, ..., `<id>.log.14.gz`). Testado forçando rotações reais
+  (`logrotate --force`) — inclusive um detalhe que só apareceu testando: o
+  `logrotate` recusa rotacionar um diretório "world-writable" (comum
+  dependendo de como o host monta o volume) por segurança; a config gerada já
+  declara `su root root` pra resolver isso, já que o container inteiro roda
+  como root mesmo.
+- **Consulta**: `scripts/logs.sh`, considera automaticamente os arquivos
+  rotacionados (inclusive `.gz`):
+
+  ```bash
+  docker compose exec pg-backup /app/scripts/logs.sh                          # lista os arquivos existentes
+  docker compose exec pg-backup /app/scripts/logs.sh app-critico               # últimas 50 linhas
+  docker compose exec pg-backup /app/scripts/logs.sh app-critico --tail 200     # últimas N linhas
+  docker compose exec pg-backup /app/scripts/logs.sh app-critico --follow        # acompanha em tempo real
+  docker compose exec pg-backup /app/scripts/logs.sh app-critico --grep ERRO      # procura em TODO o histórico, .gz incluído
+  docker compose exec pg-backup /app/scripts/logs.sh app-critico --all             # concatena tudo, do mais antigo pro mais novo
+  ```
+
+  Como o volume também fica no host, também dá pra usar qualquer ferramenta
+  direto em `./logs/<id>.log*` sem precisar entrar no container.
+
 ## Reprocessar um backup manualmente
 
 Se o dump deu certo mas o **upload falhou** em algum destino (rede,
 credencial expirada, bucket fora do ar...), o arquivo local já existe em
-`/backups` — não precisa esperar o próximo horário do cron nem gerar um dump
-novo pra tentar de novo:
+`BACKUP_DIR/<id>/` — não precisa esperar o próximo horário do cron nem gerar
+um dump novo pra tentar de novo:
 
 ```bash
 # reenvia o backup mais recente desse banco pra TODOS os destinos configurados
@@ -391,7 +444,7 @@ docker compose exec pg-backup /app/scripts/resend.sh app-critico latest
 # reenvia só pro destino que falhou (os que já deram certo não precisam)
 docker compose exec pg-backup /app/scripts/resend.sh app-critico latest oci-arquivo-frio
 
-# ou aponta um arquivo específico em vez de "latest"
+# ou aponta um arquivo específico em vez de "latest" (nome resolve dentro de BACKUP_DIR/app-critico/)
 docker compose exec pg-backup /app/scripts/resend.sh app-critico app-critico_2026-08-30_02-15-00.dump oci-arquivo-frio
 ```
 
@@ -405,8 +458,8 @@ do `backup.sh`, só que pulando `pg_dump` inteiro — e dispara notificação
    antes de subir para qualquer destino. Pega dump truncado/corrompido cedo,
    sem gastar upload. Se falhar, **o arquivo é apagado** (testado: uma falha
    de `pg_dump` — ex.: senha errada — não deixa mais um `.dump` vazio/quebrado
-   em `/backups`, que `restore.sh`/`resend.sh latest` poderiam pegar sem
-   perceber que é lixo).
+   em `BACKUP_DIR/<id>/`, que `restore.sh`/`resend.sh latest` poderiam pegar
+   sem perceber que é lixo).
 2. **Checksum** — SHA-256 do dump, salvo como `<arquivo>.sha256` e enviado
    junto a cada destino.
 3. **Verificação de upload** — após enviar, confere se o tamanho do objeto no
@@ -464,8 +517,8 @@ docker compose exec pg-backup /app/scripts/backup.sh app-critico
 ### 4. Restaurar
 
 ```bash
-# do backup local mais recente já baixado
-docker compose exec pg-backup /app/scripts/restore.sh app-critico local /backups/app-critico_2026-08-30_02-15-00.dump
+# do backup local mais recente já baixado (nome do arquivo resolve dentro de BACKUP_DIR/app-critico/)
+docker compose exec pg-backup /app/scripts/restore.sh app-critico local app-critico_2026-08-30_02-15-00.dump
 
 # baixando o mais recente de um destino específico (app-critico tem 4 configurados)
 docker compose exec pg-backup /app/scripts/restore.sh app-critico latest r2-secundario
@@ -479,7 +532,7 @@ Sempre pede confirmação interativa antes de rodar `pg_restore --clean`.
 ### 5. Verificar um backup específico
 
 ```bash
-docker compose exec pg-backup /app/scripts/verify.sh app-critico --file /backups/app-critico_2026-08-30_02-15-00.dump --test-restore
+docker compose exec pg-backup /app/scripts/verify.sh app-critico --file /backups/app-critico/app-critico_2026-08-30_02-15-00.dump --test-restore
 ```
 
 ### 6. Listar bancos configurados

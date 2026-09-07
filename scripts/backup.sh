@@ -8,6 +8,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DB_ID="${1:?uso: backup.sh <id>}"
 require_db_exists "$DB_ID"
+start_logging "$DB_ID"
 
 resolve_pg_env "$DB_ID" || exit 1
 
@@ -32,11 +33,14 @@ case "$FORMAT" in
         ;;
 esac
 
+# Cada banco tem sua própria subpasta em BACKUP_DIR — evita misturar o dump
+# de bancos diferentes no mesmo diretório (BACKUP_DIR/<id>/<id>_....ext).
+DB_BACKUP_DIR="${BACKUP_DIR}/${DB_ID}"
 TIMESTAMP="$(date +%Y-%m-%d_%H-%M-%S)"
 FILENAME="${DB_ID}_${TIMESTAMP}.${EXT}"
-FILEPATH="${BACKUP_DIR}/${FILENAME}"
+FILEPATH="${DB_BACKUP_DIR}/${FILENAME}"
 
-mkdir -p "$BACKUP_DIR"
+mkdir -p "$DB_BACKUP_DIR"
 log "$DB_ID" "iniciando dump de '${PG_DATABASE}' em ${PG_HOST}:${PG_PORT} -> ${FILEPATH}"
 
 # -Fc: formato custom (binário, comprimido, portátil, permite restore seletivo/paralelo).
@@ -102,7 +106,7 @@ if [ "$FAILED_DEST" = "1" ]; then
 fi
 
 # Retenção local: apaga dumps (e seus .sha256) mais antigos que X dias
-find "$BACKUP_DIR" -maxdepth 1 -name "${DB_ID}_*" -mtime "+${LOCAL_RETENTION_DAYS}" -print -delete \
+find "$DB_BACKUP_DIR" -maxdepth 1 -name "${DB_ID}_*" -mtime "+${LOCAL_RETENTION_DAYS}" -print -delete \
     | while read -r f; do log "$DB_ID" "removido backup local antigo: $f"; done
 
 # Retenção remota (s3/r2/oci_par/local — cada tipo trata do seu jeito)

@@ -20,15 +20,19 @@ DB_ID="${1:?uso: resend.sh <id> latest|<arquivo> [destino]}"
 ARG="${2:?uso: resend.sh <id> latest|<arquivo> [destino]}"
 DEST_NAME="${3:-}"
 require_db_exists "$DB_ID"
+start_logging "$DB_ID"
+
+# Cada banco tem sua própria subpasta em BACKUP_DIR (ver backup.sh).
+DB_BACKUP_DIR="${BACKUP_DIR}/${DB_ID}"
 
 if [ "$ARG" = "latest" ]; then
-    FILENAME=$(find "$BACKUP_DIR" -maxdepth 1 -name "${DB_ID}_*" ! -name "*.sha256" -printf '%f\n' 2>/dev/null | sort | tail -n1)
-    [ -n "$FILENAME" ] || { echo "[resend] ERRO: nenhum backup local encontrado para '${DB_ID}' em ${BACKUP_DIR}" >&2; exit 1; }
-    FILEPATH="${BACKUP_DIR}/${FILENAME}"
+    FILENAME=$(find "$DB_BACKUP_DIR" -maxdepth 1 -name "${DB_ID}_*" ! -name "*.sha256" -printf '%f\n' 2>/dev/null | sort | tail -n1)
+    [ -n "$FILENAME" ] || { echo "[resend] ERRO: nenhum backup local encontrado para '${DB_ID}' em ${DB_BACKUP_DIR}" >&2; exit 1; }
+    FILEPATH="${DB_BACKUP_DIR}/${FILENAME}"
 else
     case "$ARG" in
         /*) FILEPATH="$ARG" ;;
-        *)  FILEPATH="${BACKUP_DIR}/${ARG}" ;;
+        *)  FILEPATH="${DB_BACKUP_DIR}/${ARG}" ;;
     esac
 fi
 

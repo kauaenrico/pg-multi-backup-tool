@@ -13,7 +13,16 @@ echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 echo "TZ=${TZ:-America/Sao_Paulo}"
 echo "CONFIG_FILE=${CONFIG_FILE}"
 echo "BACKUP_DIR=${BACKUP_DIR}"
+echo "LOG_DIR=${LOG_DIR}"
+echo
 
+# Rotaciona LOG_DIR/*.log uma vez por dia (config gerada por entrypoint.sh a
+# partir de LOG_DIR — ver render-logrotate.sh). Log dessa própria rotação vai
+# num arquivo à parte, pra não se misturar com o log de nenhum banco.
+echo "0 0 * * * logrotate /etc/logrotate.d/pg-backup --state /var/lib/logrotate/pg-backup.state >> ${LOG_DIR}/logrotate.log 2>&1"
+
+# backup.sh já redireciona a própria saída pra LOG_DIR/<id>.log sozinho (via
+# start_logging em common.sh) — não precisa de `>> arquivo 2>&1` aqui.
 yq e -o=json '.databases // []' "$CONFIG_FILE" | jq -c '.[]' | while IFS= read -r db; do
     id=$(echo "$db" | jq -r '.id')
     # `.enabled // true` seria um bug aqui: jq trata `false` como "vazio" no
@@ -24,5 +33,5 @@ yq e -o=json '.databases // []' "$CONFIG_FILE" | jq -c '.[]' | while IFS= read -
     schedule=$(echo "$db" | jq -r '.schedule // empty')
     [ -n "$schedule" ] || schedule="0 3 * * *"
 
-    echo "${schedule} /app/scripts/backup.sh ${id} >> /var/log/pg-backup/${id}.log 2>&1"
+    echo "${schedule} /app/scripts/backup.sh ${id}"
 done

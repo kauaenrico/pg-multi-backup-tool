@@ -13,7 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         cron \
         curl \
+        gzip \
         jq \
+        logrotate \
         msmtp \
         tzdata \
         unzip \
@@ -27,9 +29,16 @@ RUN curl -fsSL -o /usr/local/bin/yq \
         "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${TARGETARCH:-amd64}" \
     && chmod +x /usr/local/bin/yq
 
+# RCLONE_CONFIG=/dev/null: nunca usamos rclone.conf (cada destino s3/r2 leva
+# a própria credencial embutida na chamada — ver rclone_remote_string em
+# common.sh), então sem isso todo `rclone` imprime um NOTICE poluindo os logs
+# avisando que não achou o arquivo de config padrão. Confirmado testando: com
+# essa env var, o aviso some e o comportamento do rclone continua idêntico.
 ENV TZ=America/Sao_Paulo \
     CONFIG_FILE=/app/config/databases.yml \
-    BACKUP_DIR=/backups
+    BACKUP_DIR=/backups \
+    LOG_DIR=/var/log/pg-backup \
+    RCLONE_CONFIG=/dev/null
 
 WORKDIR /app
 

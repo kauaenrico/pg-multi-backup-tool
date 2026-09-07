@@ -11,10 +11,28 @@
 
 : "${CONFIG_FILE:=/app/config/databases.yml}"
 : "${BACKUP_DIR:=/backups}"
+: "${LOG_DIR:=/var/log/pg-backup}"
 
 log() {
     local id="$1"; shift
     echo "[${id}] $(date -Iseconds) $*"
+}
+
+# start_logging <id>
+# Espelha TODA a saída (stdout+stderr) do processo atual — não só as linhas de
+# log(), qualquer coisa, inclusive erro cru de pg_dump/rclone/curl — para
+# LOG_DIR/<id>.log, além de continuar imprimindo no terminal normalmente.
+# Chamada uma vez, no início de backup.sh/resend.sh/restore.sh/verify.sh, faz
+# com que TODA execução (via cron ou manual via `docker compose exec`) fique
+# registrada no mesmo arquivo persistido — sem isso, o job do cron escrevia
+# só num arquivo dentro da camada gravável do container (que não sobrevive a
+# `docker compose down`/recriação) e uma execução manual não deixava rastro
+# nenhum. Rotação de LOG_DIR/*.log é feita pelo `logrotate` (ver entrypoint.sh).
+start_logging() {
+    local id="$1" logfile
+    mkdir -p "$LOG_DIR" 2>/dev/null
+    logfile="${LOG_DIR}/${id}.log"
+    exec > >(tee -a "$logfile") 2>&1
 }
 
 # db_notifications_json <id> -> um JSON compacto por linha, um por canal.

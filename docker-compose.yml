@@ -11,9 +11,14 @@ services:
       TZ: America/Sao_Paulo
       CONFIG_FILE: /app/config/databases.yml
       BACKUP_DIR: /backups
+      LOG_DIR: /var/log/pg-backup
     volumes:
       - ./config/databases.yml:/app/config/databases.yml:ro
       - ./backups:/backups
+      # Log de cada banco (cron e execução manual), rotacionado pelo logrotate
+      # dentro do container — persistido aqui pra sobreviver a recriações do
+      # container. Consulte com scripts/logs.sh (ver README).
+      - ./logs:/var/log/pg-backup
       # Exemplo: monte aqui qualquer caminho usado por um destino "type: local"
       # em databases.yml (segundo disco, NAS via bind mount do host, etc.).
       # - /mnt/backup-secundario:/mnt/backup-secundario

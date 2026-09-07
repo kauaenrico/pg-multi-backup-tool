@@ -10,7 +10,10 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     exit 1
 }
 
-mkdir -p "$BACKUP_DIR" /var/log/pg-backup
+mkdir -p "$BACKUP_DIR" "$LOG_DIR"
+
+echo "[entrypoint] $(date -Iseconds) configurando rotação de log em ${LOG_DIR}"
+"$DIR/lib/render-logrotate.sh"
 
 echo "[entrypoint] $(date -Iseconds) gerando crontab a partir de 'databases:'"
 "$DIR/lib/render-crontab.sh" > /tmp/crontab.generated
