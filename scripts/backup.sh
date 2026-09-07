@@ -40,13 +40,16 @@ mkdir -p "$BACKUP_DIR"
 log "$DB_ID" "iniciando dump de '${PG_DATABASE}' em ${PG_HOST}:${PG_PORT} -> ${FILEPATH}"
 
 # -Fc: formato custom (binário, comprimido, portátil, permite restore seletivo/paralelo).
+# Em qualquer falha daqui pra baixo, o arquivo é apagado antes de sair — um
+# .dump vazio ou corrompido parado em BACKUP_DIR seria pego como "o backup
+# mais recente" por restore.sh/resend.sh latest, então não pode sobrar.
 pg_dump -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DATABASE" \
     "$PGDUMP_FMT_FLAG" -Z 6 --no-owner --no-privileges -f "$FILEPATH" \
-    || fail_db "$DB_ID" "pg_dump retornou erro"
+    || { rm -f "$FILEPATH"; fail_db "$DB_ID" "pg_dump retornou erro"; }
 
 if [ "$DO_STRUCT_CHECK" = "true" ] && [ "$FORMAT" != "plain" ]; then
     pg_restore --list "$FILEPATH" >/dev/null 2>&1 \
-        || fail_db "$DB_ID" "dump gerado é inválido (pg_restore --list falhou)"
+        || { rm -f "$FILEPATH"; fail_db "$DB_ID" "dump gerado é inválido (pg_restore --list falhou)"; }
     log "$DB_ID" "checagem estrutural do dump OK"
 fi
 

@@ -27,24 +27,24 @@ first_destination_name() {
 }
 
 download_from_destination() {
-    local dest_name="$1" fname="$2" dest type remote bucket prefix var url dest_path
+    local dest_name="$1" fname="$2" dest type bucket prefix remote_str remote_path url dest_path
     dest=$(find_destination "$DB_ID" "$dest_name")
     [ -n "$dest" ] || { echo "[restore] ERRO: destino '${dest_name}' não encontrado para '${DB_ID}'" >&2; exit 1; }
     type=$(echo "$dest" | jq -r '.type')
     case "$type" in
         s3|r2)
-            remote=$(echo "$dest" | jq -r '.remote')
             bucket=$(echo "$dest" | jq -r '.bucket')
             prefix=$(echo "$dest" | jq -r '.prefix // ""')
-            echo "[restore] baixando '${fname}' de '${dest_name}' (${remote}:${bucket}/${prefix})"
-            rclone copy "${remote}:${bucket}/${prefix}${fname}" "$BACKUP_DIR" --s3-no-check-bucket \
+            remote_str=$(rclone_remote_string "$dest")
+            remote_path="${remote_str}${bucket}/${prefix}"
+            echo "[restore] baixando '${fname}' de '${dest_name}' (bucket ${bucket}/${prefix})"
+            rclone copy "${remote_path}${fname}" "$BACKUP_DIR" --s3-no-check-bucket \
                 || { echo "[restore] ERRO: download falhou"; exit 1; }
-            rclone copy "${remote}:${bucket}/${prefix}${fname}.sha256" "$BACKUP_DIR" --s3-no-check-bucket 2>/dev/null || true
+            rclone copy "${remote_path}${fname}.sha256" "$BACKUP_DIR" --s3-no-check-bucket 2>/dev/null || true
             ;;
         oci_par)
-            var=$(echo "$dest" | jq -r '.par_url_env')
-            url="${!var:-}"
-            [ -n "$url" ] || { echo "[restore] ERRO: variável '${var}' (PAR) não definida"; exit 1; }
+            url=$(echo "$dest" | jq -r '.par_url // ""')
+            [ -n "$url" ] || { echo "[restore] ERRO: destino '${dest_name}' sem 'par_url' configurada"; exit 1; }
             url="${url%/}"
             echo "[restore] baixando '${fname}' de '${dest_name}' (OCI PAR)"
             curl -fsS -o "${BACKUP_DIR}/${fname}" "${url}/${fname}" \
@@ -75,19 +75,18 @@ case "$MODE" in
         DEST_TYPE=$(echo "$DEST_JSON" | jq -r '.type // empty')
         case "$DEST_TYPE" in
             s3|r2)
-                REMOTE=$(echo "$DEST_JSON" | jq -r '.remote')
                 BUCKET=$(echo "$DEST_JSON" | jq -r '.bucket')
                 PREFIX=$(echo "$DEST_JSON" | jq -r '.prefix // ""')
-                LATEST=$(rclone lsjson "${REMOTE}:${BUCKET}/${PREFIX}" --s3-no-check-bucket 2>/dev/null \
+                REMOTE_STR=$(rclone_remote_string "$DEST_JSON")
+                LATEST=$(rclone lsjson "${REMOTE_STR}${BUCKET}/${PREFIX}" --s3-no-check-bucket 2>/dev/null \
                     | jq -r --arg id "$DB_ID" '[.[] | select(.Name | startswith($id + "_")) | select(.Name | endswith(".sha256") | not)] | sort_by(.ModTime) | last | .Name // empty')
                 ;;
             oci_par)
                 # Só funciona em PARs de bucket criadas com "Enable Object
                 # Listing" habilitado na OCI; sem isso o GET de listagem falha
                 # e nada é retornado aqui.
-                PAR_VAR=$(echo "$DEST_JSON" | jq -r '.par_url_env')
-                PAR_URL="${!PAR_VAR:-}"
-                [ -n "$PAR_URL" ] || { echo "[restore] ERRO: variável '${PAR_VAR}' (PAR) não definida" >&2; exit 1; }
+                PAR_URL=$(echo "$DEST_JSON" | jq -r '.par_url // ""')
+                [ -n "$PAR_URL" ] || { echo "[restore] ERRO: destino '${DEST_NAME}' sem 'par_url' configurada" >&2; exit 1; }
                 LATEST=$(oci_par_list_names "$PAR_URL" \
                     | grep -E "^${DB_ID}_" | grep -v '\.sha256$' | sort | tail -n1)
                 if [ -z "$LATEST" ]; then

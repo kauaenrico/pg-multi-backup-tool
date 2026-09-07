@@ -1,6 +1,13 @@
 #!/bin/bash
-# Funções compartilhadas por entrypoint.sh, backup.sh, restore.sh, verify.sh e list.sh.
-# Este arquivo é sempre carregado via `. lib/common.sh`, nunca executado diretamente.
+# Funções compartilhadas por entrypoint.sh, backup.sh, restore.sh, resend.sh,
+# verify.sh e list.sh. Este arquivo é sempre carregado via `. lib/common.sh`,
+# nunca executado diretamente.
+#
+# Cada banco em `databases.yml` é 100% autocontido: sem `defaults:`, sem
+# `remotes:` compartilhado, sem indireção via `.env`/variável de ambiente.
+# Todo valor (senha, chave de API, token, URL) fica escrito direto no YAML,
+# de propósito — é o próprio `config/databases.yml` que fica fora do git
+# (.gitignore), não um `.env` separado.
 
 : "${CONFIG_FILE:=/app/config/databases.yml}"
 : "${BACKUP_DIR:=/backups}"
@@ -10,16 +17,10 @@ log() {
     echo "[${id}] $(date -Iseconds) $*"
 }
 
-# db_notifications_json <id>
-# Lista de canais de notificação (um JSON compacto por linha) do banco <id>;
-# se o banco não define `notifications:`, cai inteiro para `defaults.notifications`
-# (é tudo ou nada, sem merge campo a campo — mesmo espírito de `destinations:`).
+# db_notifications_json <id> -> um JSON compacto por linha, um por canal.
 db_notifications_json() {
     local id="$1" result
     result=$(DB_ID="$id" yq e -o=json "(.databases[] | select(.id == strenv(DB_ID)) | .notifications)" "$CONFIG_FILE" 2>/dev/null)
-    if [ -z "$result" ] || [ "$result" = "null" ]; then
-        result=$(yq e -o=json '.defaults.notifications' "$CONFIG_FILE" 2>/dev/null)
-    fi
     [ -n "$result" ] && [ "$result" != "null" ] || return 0
     echo "$result" | jq -c '.[]'
 }
@@ -61,10 +62,9 @@ emoji_for() {
 
 notify_webhook() {
     local id="$1" name="$2" chan="$3" event="$4" message="$5"
-    local url_var url format body emoji
-    url_var=$(echo "$chan" | jq -r '.url_env')
-    url="${!url_var:-}"
-    [ -n "$url" ] || { log "$id" "aviso: variável '${url_var}' (webhook '${name}') não definida"; return; }
+    local url format body emoji
+    url=$(echo "$chan" | jq -r '.url // ""')
+    [ -n "$url" ] || { log "$id" "aviso: webhook '${name}' sem 'url' configurada"; return; }
     format=$(echo "$chan" | jq -r '.format // "generic"')
     emoji=$(emoji_for "$event")
     case "$format" in
@@ -77,12 +77,10 @@ notify_webhook() {
 
 notify_telegram() {
     local id="$1" name="$2" chan="$3" event="$4" message="$5"
-    local token_var chatid_var token chatid emoji
-    token_var=$(echo "$chan" | jq -r '.bot_token_env')
-    chatid_var=$(echo "$chan" | jq -r '.chat_id_env')
-    token="${!token_var:-}"
-    chatid="${!chatid_var:-}"
-    [ -n "$token" ] && [ -n "$chatid" ] || { log "$id" "aviso: token/chat_id ausentes pro Telegram '${name}'"; return; }
+    local token chatid emoji
+    token=$(echo "$chan" | jq -r '.bot_token // ""')
+    chatid=$(echo "$chan" | jq -r '.chat_id // ""')
+    [ -n "$token" ] && [ -n "$chatid" ] || { log "$id" "aviso: 'bot_token'/'chat_id' ausentes pro Telegram '${name}'"; return; }
     emoji=$(emoji_for "$event")
     curl -fsS -m 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
         --data-urlencode "chat_id=${chatid}" \
@@ -93,10 +91,9 @@ notify_telegram() {
 
 notify_ntfy() {
     local id="$1" name="$2" chan="$3" event="$4" message="$5"
-    local url_var url priority emoji
-    url_var=$(echo "$chan" | jq -r '.url_env')
-    url="${!url_var:-}"
-    [ -n "$url" ] || { log "$id" "aviso: variável '${url_var}' (ntfy '${name}') não definida"; return; }
+    local url priority emoji
+    url=$(echo "$chan" | jq -r '.url // ""')
+    [ -n "$url" ] || { log "$id" "aviso: ntfy '${name}' sem 'url' configurada"; return; }
     priority=$(echo "$chan" | jq -r '.priority // "default"')
     emoji=$(emoji_for "$event")
     curl -fsS -m 10 \
@@ -114,21 +111,13 @@ notify_ntfy() {
 # — igual ao PGPASSWORD do pg_dump, nunca vira argumento de linha de comando.
 notify_email() {
     local id="$1" name="$2" chan="$3" event="$4" message="$5"
-    local host_var port_var user_var pass_var from_var to_var
     local host port user pass from to subject emoji
-    host_var=$(echo "$chan" | jq -r '.smtp_host_env')
-    port_var=$(echo "$chan" | jq -r '.smtp_port_env // ""')
-    user_var=$(echo "$chan" | jq -r '.smtp_user_env')
-    pass_var=$(echo "$chan" | jq -r '.smtp_password_env')
-    from_var=$(echo "$chan" | jq -r '.from_env')
-    to_var=$(echo "$chan" | jq -r '.to_env')
-    host="${!host_var:-}"
-    port=587
-    [ -n "$port_var" ] && port="${!port_var:-587}"
-    user="${!user_var:-}"
-    pass="${!pass_var:-}"
-    from="${!from_var:-}"
-    to="${!to_var:-}"
+    host=$(echo "$chan" | jq -r '.smtp_host // ""')
+    port=$(echo "$chan" | jq -r '.smtp_port // 587')
+    user=$(echo "$chan" | jq -r '.smtp_user // ""')
+    pass=$(echo "$chan" | jq -r '.smtp_password // ""')
+    from=$(echo "$chan" | jq -r '.from // ""')
+    to=$(echo "$chan" | jq -r '.to // ""')
     [ -n "$host" ] && [ -n "$user" ] && [ -n "$pass" ] && [ -n "$from" ] && [ -n "$to" ] \
         || { log "$id" "aviso: configuração SMTP incompleta pro e-mail '${name}'"; return; }
 
@@ -165,7 +154,9 @@ require_db_exists() {
 
 # db_get <id> <caminho-relativo-iniciando-com-.> [default]
 # Busca o campo dentro do objeto do banco identificado por <id>; se ausente,
-# cai para o mesmo caminho dentro de `defaults:`; se ainda ausente, usa [default].
+# usa [default] (um valor fixo do próprio script, não de outra seção do YAML
+# — cada banco é 100% independente, não existe fallback pra config de outro
+# lugar do arquivo).
 #
 # IMPORTANTE: nunca use aqui o operador `//` do yq/jq como fallback (`campo //
 # "default"`) — ele trata `false` como "vazio" igual a null/ausente, então um
@@ -175,9 +166,6 @@ require_db_exists() {
 db_get() {
     local id="$1" relpath="$2" default="${3:-}" val
     val=$(DB_ID="$id" yq e "(.databases[] | select(.id == strenv(DB_ID))${relpath})" "$CONFIG_FILE" 2>/dev/null)
-    if [ -z "$val" ] || [ "$val" = "null" ]; then
-        val=$(yq e "(.defaults${relpath})" "$CONFIG_FILE" 2>/dev/null)
-    fi
     if [ -z "$val" ] || [ "$val" = "null" ]; then
         val="$default"
     fi
@@ -232,12 +220,9 @@ resolve_pg_env() {
     PG_PORT=$(db_get "$id" ".connection.port" "5432")
     PG_USER=$(db_get "$id" ".connection.user" "postgres")
     PG_DATABASE=$(db_get "$id" ".connection.database")
-    local pwvar
-    pwvar=$(db_get "$id" ".connection.password_env")
-    [ -n "$PG_HOST" ] && [ -n "$PG_DATABASE" ] && [ -n "$pwvar" ] \
-        || { log "$id" "ERRO: configuração incompleta (connection.host/database/password_env)"; return 1; }
-    PGPASSWORD="${!pwvar:-}"
-    [ -n "$PGPASSWORD" ] || { log "$id" "ERRO: variável de ambiente '${pwvar}' (senha) não definida"; return 1; }
+    PGPASSWORD=$(db_get "$id" ".connection.password")
+    [ -n "$PG_HOST" ] && [ -n "$PG_DATABASE" ] && [ -n "$PGPASSWORD" ] \
+        || { log "$id" "ERRO: configuração incompleta (connection.host/database/password)"; return 1; }
     export PGPASSWORD
 }
 
@@ -255,6 +240,28 @@ oci_par_remote_md5_hex() {
     b64=$(curl -sS -I "$url" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-md5"{print $2}')
     [ -n "$b64" ] || return 1
     echo "$b64" | base64 -d 2>/dev/null | od -An -tx1 | tr -d ' \n'
+}
+
+# rclone_remote_string <destino-json>
+# Monta uma "on the fly remote" do rclone (sem rclone.conf, sem remote
+# nomeado/compartilhado): as credenciais do destino ficam embutidas na
+# própria string, direto do YAML. NUNCA logue o valor de retorno dessa
+# função — ele contém access_key_id/secret_access_key em texto puro. Use só
+# como argumento passado pro `rclone`, e componha mensagens de log a partir
+# de campos como .name/.bucket/.prefix, nunca da string inteira.
+rclone_remote_string() {
+    local dest="$1" provider region endpoint ak sk out
+    provider=$(echo "$dest" | jq -r '.provider // ""')
+    region=$(echo "$dest" | jq -r '.region // ""')
+    endpoint=$(echo "$dest" | jq -r '.endpoint // ""')
+    ak=$(echo "$dest" | jq -r '.access_key_id // ""')
+    sk=$(echo "$dest" | jq -r '.secret_access_key // ""')
+    out=":s3"
+    [ -n "$provider" ] && out="${out},provider=${provider}"
+    [ -n "$region" ] && out="${out},region=${region}"
+    [ -n "$endpoint" ] && out="${out},endpoint=\"${endpoint}\""
+    out="${out},access_key_id=\"${ak}\",secret_access_key=\"${sk}\":"
+    printf '%s' "$out"
 }
 
 # upload_local <id> <destino-json> <arquivo> <arquivo-sha256-ou-vazio> <verificar-tamanho:true|false> <verificar-checksum:true|false>
@@ -310,17 +317,17 @@ upload_local() {
 # upload_rclone <id> <destino-json> <arquivo> <arquivo-sha256-ou-vazio> <verificar-tamanho:true|false> <verificar-checksum:true|false>
 upload_rclone() {
     local id="$1" dest="$2" filepath="$3" shafile="$4" verify="$5" verify_checksum="${6:-false}"
-    local name remote bucket prefix remote_path fname
+    local name bucket prefix remote_str remote_path fname
     name=$(echo "$dest" | jq -r '.name')
-    remote=$(echo "$dest" | jq -r '.remote')
     bucket=$(echo "$dest" | jq -r '.bucket')
     prefix=$(echo "$dest" | jq -r '.prefix // ""')
-    remote_path="${remote}:${bucket}/${prefix}"
+    remote_str=$(rclone_remote_string "$dest")
+    remote_path="${remote_str}${bucket}/${prefix}"
     fname=$(basename "$filepath")
 
-    log "$id" "enviando para destino '${name}' (${remote_path})"
+    log "$id" "enviando para destino '${name}' (bucket ${bucket}/${prefix})"
     if ! rclone copy "$filepath" "$remote_path" --checksum --s3-no-check-bucket; then
-        log "$id" "ERRO: falha ao enviar para destino '${name}' (${remote_path})"
+        log "$id" "ERRO: falha ao enviar para destino '${name}'"
         return 1
     fi
     if [ -n "$shafile" ]; then
@@ -362,11 +369,10 @@ upload_rclone() {
 # o nome do arquivo é anexado à URL do PAR.
 upload_oci_par() {
     local id="$1" dest="$2" filepath="$3" shafile="$4" verify="$5" verify_checksum="${6:-false}"
-    local name var url fname http_code
+    local name url fname http_code
     name=$(echo "$dest" | jq -r '.name')
-    var=$(echo "$dest" | jq -r '.par_url_env')
-    url="${!var:-}"
-    [ -n "$url" ] || { log "$id" "ERRO: variável '${var}' (PAR da OCI) não definida para destino '${name}'"; return 1; }
+    url=$(echo "$dest" | jq -r '.par_url // ""')
+    [ -n "$url" ] || { log "$id" "ERRO: destino '${name}' sem 'par_url' configurada"; return 1; }
     url="${url%/}"
     fname=$(basename "$filepath")
 
@@ -451,12 +457,12 @@ apply_local_dest_retention() {
 }
 
 apply_rclone_retention() {
-    local id="$1" dest="$2" remote_days="$3" name remote bucket prefix remote_path
+    local id="$1" dest="$2" remote_days="$3" name bucket prefix remote_str remote_path
     name=$(echo "$dest" | jq -r '.name')
-    remote=$(echo "$dest" | jq -r '.remote')
     bucket=$(echo "$dest" | jq -r '.bucket')
     prefix=$(echo "$dest" | jq -r '.prefix // ""')
-    remote_path="${remote}:${bucket}/${prefix}"
+    remote_str=$(rclone_remote_string "$dest")
+    remote_path="${remote_str}${bucket}/${prefix}"
     if ! rclone delete "$remote_path" --min-age "${remote_days}d" --s3-no-check-bucket --include "${id}_*"; then
         log "$id" "aviso: falha ao aplicar retenção remota em '${name}' (não é fatal)"
         return 1
@@ -472,11 +478,10 @@ apply_rclone_retention() {
 # falha de remoção vira só um aviso, igual ao comportamento já existente para
 # falhas de retenção em s3/r2.
 apply_oci_par_retention() {
-    local id="$1" dest="$2" remote_days="$3" name var url now_epoch failed=0
+    local id="$1" dest="$2" remote_days="$3" name url now_epoch failed=0
     name=$(echo "$dest" | jq -r '.name')
-    var=$(echo "$dest" | jq -r '.par_url_env')
-    url="${!var:-}"
-    [ -n "$url" ] || { log "$id" "aviso: variável '${var}' (PAR) não definida, pulando retenção remota em '${name}'"; return 1; }
+    url=$(echo "$dest" | jq -r '.par_url // ""')
+    [ -n "$url" ] || { log "$id" "aviso: destino '${name}' sem 'par_url', pulando retenção remota"; return 1; }
     url="${url%/}"
     now_epoch=$(date +%s)
 

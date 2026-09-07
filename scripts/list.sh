@@ -5,8 +5,6 @@ set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$DIR/lib/common.sh"
 
-DEFAULT_SCHEDULE=$(yq e '.defaults.schedule // "0 3 * * *"' "$CONFIG_FILE")
-
 {
     printf 'ID\tHABILITADO\tHOST\tBANCO\tSCHEDULE\tDESTINOS\n'
     yq e -o=json '.databases // []' "$CONFIG_FILE" | jq -c '.[]' | while IFS= read -r db; do
@@ -15,7 +13,7 @@ DEFAULT_SCHEDULE=$(yq e '.defaults.schedule // "0 3 * * *"' "$CONFIG_FILE")
         host=$(echo "$db" | jq -r '.connection.host // "-"')
         dbname=$(echo "$db" | jq -r '.connection.database // "-"')
         schedule=$(echo "$db" | jq -r '.schedule // empty')
-        [ -n "$schedule" ] || schedule="${DEFAULT_SCHEDULE} (default)"
+        [ -n "$schedule" ] || schedule="0 3 * * * (default)"
         destinations=$(echo "$db" | jq -r '[.destinations[]?.name] | join(",")')
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$enabled" "$host" "$dbname" "$schedule" "$destinations"
     done

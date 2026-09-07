@@ -12,9 +12,6 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 mkdir -p "$BACKUP_DIR" /var/log/pg-backup
 
-echo "[entrypoint] $(date -Iseconds) renderizando rclone.conf a partir de 'remotes:'"
-"$DIR/lib/render-rclone-conf.sh"
-
 echo "[entrypoint] $(date -Iseconds) gerando crontab a partir de 'databases:'"
 "$DIR/lib/render-crontab.sh" > /tmp/crontab.generated
 crontab /tmp/crontab.generated

@@ -15,24 +15,29 @@ dentro de cada projeto.
   servidores Postgres mais antigos sem precisar de uma imagem por versão.
 - O container entra na(s) mesma(s) network(s) Docker que os projetos já usam
   e conecta em cada Postgres pelo nome do container/serviço (`host:porta`).
-- Toda a configuração — quais bancos existem, horário de cada um, retenção,
-  para onde enviar — fica em **um arquivo YAML** (`config/databases.yml`).
-  Nenhum segredo fica em texto puro nesse arquivo: cada campo sensível é o
-  *nome* de uma variável de ambiente, cujo valor vem do `.env`.
+- Toda a configuração fica em **um único arquivo YAML**
+  (`config/databases.yml`), e **cada banco é 100% independente** — sem seção
+  compartilhada tipo "defaults", sem remote nomeado reutilizado entre bancos.
+  Todo valor, inclusive senha/chave de API/token, fica escrito direto no
+  campo correspondente, por banco — **não existe `.env`**: é o próprio
+  `config/databases.yml` que fica fora do git (`.gitignore`) e guarda os
+  segredos.
 - O agendamento é feito com `cron` de verdade dentro do container: no start,
   o `entrypoint.sh` lê `databases.yml` e gera um crontab com uma linha por
   banco habilitado, cada uma rodando `backup.sh <id>`. **Bancos com o mesmo
   horário rodam de verdade em paralelo** — confirmado observando dois
-  `pg_dump` simultâneos disparados pelo próprio cron, não só em teoria.
-  O `cron` também só entrega aos jobs um ambiente mínimo (`HOME`/`PATH`/
-  `SHELL`), sem nada do `.env` — por isso o crontab gerado inclui todas as
-  variáveis de ambiente do container como linhas `VAR=valor`, senão toda
-  senha/chave/URL referenciada via `*_env` ficaria invisível pro job quando
-  o cron dispara sozinho (só funcionaria rodando manualmente via `docker
-  compose exec`, que herda o ambiente do container de outro jeito).
-- Upload é feito via `rclone` (qualquer backend S3-compatível: S3, Cloudflare
-  R2, MinIO, B2 via API S3 etc.) ou via `curl` puro para uma **Pre-Authenticated
-  Request (PAR)** da OCI Object Storage.
+  `pg_dump` simultâneos disparados pelo próprio cron, não só em teoria. Como
+  toda a configuração (inclusive segredos) mora no arquivo YAML — não em
+  variável de ambiente —, o job disparado pelo cron lê exatamente os mesmos
+  dados que uma execução manual via `docker compose exec` leria, sem precisar
+  de nenhum truque de propagação de ambiente.
+- Upload S3/R2 é feito via `rclone`, mas **sem `rclone.conf` compartilhado**:
+  cada destino monta sua própria "remote on the fly" do rclone
+  (`:s3,provider=...,access_key_id="...",secret_access_key="...":bucket/`)
+  na hora da chamada, usando só as credenciais daquele destino específico —
+  testado contra um MinIO real (upload, download, listagem, hashsum,
+  delete). PARs da OCI são feitas via `curl` puro (`PUT`/`GET`/`HEAD`/`DELETE`
+  direto na URL).
 - Notificações são configuráveis por evento (início, sucesso, aviso, falha) e
   por canal (webhook Slack/Discord/genérico, Telegram, e-mail via SMTP, ntfy)
   — ver seção "Notificações" abaixo.
@@ -43,7 +48,7 @@ dentro de cada projeto.
 config/
   databases.example.yml   # copie para databases.yml e edite
 scripts/
-  entrypoint.sh            # gera rclone.conf + crontab e sobe o cron em foreground
+  entrypoint.sh            # gera o crontab e sobe o cron em foreground
   backup.sh <id>            # dump -> checagens -> upload -> retenção
   resend.sh <id> ...         # reenvia um dump JÁ EXISTENTE local, sem rodar pg_dump de novo
   restore.sh <id> ...         # baixa e restaura um backup
@@ -51,87 +56,57 @@ scripts/
   list.sh                       # lista os bancos configurados
   lib/
     common.sh                   # funções compartilhadas
-    render-rclone-conf.sh         # gera rclone.conf a partir de `remotes:`
-    render-crontab.sh              # gera o crontab a partir de `databases:`
+    render-crontab.sh            # gera o crontab a partir de `databases:`
 Dockerfile
 docker-compose.yml
-.env.example
 ```
 
 ## Configuração (`databases.yml`)
 
 `config/databases.example.yml` (reproduzido aqui, sempre sincronizado com o
-arquivo real) traz `defaults`, `remotes` e **3 bancos de exemplo**, cada um
-variando um conjunto diferente de parâmetros pra cobrir, entre os três, quase
-toda a superfície de configuração possível:
+arquivo real) traz **3 bancos de exemplo**, cada um variando um conjunto
+diferente de parâmetros pra cobrir, entre os três, quase toda a superfície de
+configuração possível. Cada banco é uma entrada completa e autocontida —
+nada de herdar de uma seção comum:
 
-- **`app-simples`** — o mínimo indispensável: só os campos obrigatórios, tudo
-  o resto herda de `defaults`. Um único destino na nuvem, **sem** nenhum
-  destino `local` além do staging temporário que sempre existe.
-- **`app-critico`** — todo campo sobrescrito (schedule, retenção, os 5 flags
-  de `verify`, incluindo os dois opt-in) e backup replicado nos **4 tipos de
-  destino ao mesmo tempo** (S3 + R2 + OCI PAR + disco local).
+- **`app-simples`** — o mínimo indispensável: só os campos realmente
+  obrigatórios, o resto usa o valor padrão do próprio script. Um único
+  destino na nuvem, **sem** nenhum destino `local` além do staging temporário
+  que sempre existe.
+- **`app-critico`** — todo campo explícito (schedule, retenção, os 5 flags de
+  `verify`, incluindo os dois opt-in) e backup replicado nos **4 tipos de
+  destino ao mesmo tempo** (S3 + R2 + OCI PAR + disco local), cada um com sua
+  própria credencial embutida — nenhum "remote" compartilhado entre eles.
+  Notificação em 3 canais diferentes (Telegram + e-mail + Discord), cada um
+  com seu próprio conjunto de eventos.
 - **`app-legado`** — `format: plain` (em vez do `custom` default),
   `enabled: false` (fora do crontab automático, mas ainda rodável na mão) e
   um único destino, do tipo `local` — o espelho do `app-simples` (que não
-  tinha nenhum `local`).
-
-Notificações seguem a mesma lógica: `app-simples` herda o webhook de
-`defaults`; `app-critico` sobrescreve com Telegram + e-mail + Discord, cada
-canal num conjunto de eventos diferente; `app-legado` usa só um `ntfy` em
-`on: [failure]`.
+  tinha nenhum `local`). Notificação mínima: só um `ntfy` em `on: [failure]`.
 
 ```yaml
-defaults:
-  schedule: "0 3 * * *"
-  format: custom
-  retention:
-    local_days: 7
-    remote_days: 30
-  verify:
-    structural_check: true
-    checksum: true
-    verify_upload: true
-    checksum_after_upload: false
-    test_restore: false
-  notifications:
-    - type: webhook
-      format: slack
-      url_env: DEFAULT_WEBHOOK_URL
-      on: [failure, warning]
-
-remotes:
-  - name: r2-principal
-    type: s3
-    provider: Cloudflare
-    endpoint_env: R2_ENDPOINT
-    access_key_id_env: R2_ACCESS_KEY_ID
-    secret_access_key_env: R2_SECRET_ACCESS_KEY
-
-  - name: s3-aws-generico
-    type: s3
-    provider: AWS
-    region: us-east-1
-    access_key_id_env: AWS_ACCESS_KEY_ID
-    secret_access_key_env: AWS_SECRET_ACCESS_KEY
-
 databases:
-  # 1) MÍNIMO POSSÍVEL — só os campos obrigatórios, resto herda de `defaults`.
-  #    Único destino, na nuvem, sem nenhum "local".
   - id: app-simples
+    schedule: "0 3 * * *"
     connection:
       host: app-simples-postgres
       database: app_simples
-      password_env: APP_SIMPLES_PGPASSWORD
+      password: "TROQUE-ESTA-SENHA"
     destinations:
       - name: r2-principal
         type: r2
-        remote: r2-principal
+        provider: Cloudflare
+        endpoint: "https://SEU_ACCOUNT_ID.r2.cloudflarestorage.com"
+        access_key_id: "SUA_R2_ACCESS_KEY_ID"
+        secret_access_key: "SUA_R2_SECRET_ACCESS_KEY"
         bucket: app-simples-backups
         prefix: app-simples/
+    notifications:
+      - type: webhook
+        format: slack
+        url: "https://hooks.slack.com/services/SEU/WEBHOOK/AQUI"
+        on: [failure]
 
-  # 2) "CINTO E SUSPENSÓRIOS" — tudo sobrescrito, verificação máxima, backup
-  #    nos 4 tipos de destino ao mesmo tempo.
   - id: app-critico
     enabled: true
     schedule: "15 2 * * *"
@@ -141,7 +116,7 @@ databases:
       port: 5432
       user: postgres
       database: app_critico
-      password_env: APP_CRITICO_PGPASSWORD
+      password: "TROQUE-ESTA-SENHA-TAMBEM"
     retention:
       local_days: 14
       remote_days: 90
@@ -154,109 +129,94 @@ databases:
     destinations:
       - name: s3-principal
         type: s3
-        remote: s3-aws-generico
+        provider: AWS
+        region: us-east-1
+        access_key_id: "SUA_AWS_ACCESS_KEY_ID"
+        secret_access_key: "SUA_AWS_SECRET_ACCESS_KEY"
         bucket: app-critico-backups-primario
         prefix: app-critico/
       - name: r2-secundario
         type: r2
-        remote: r2-principal
+        provider: Cloudflare
+        endpoint: "https://SEU_ACCOUNT_ID.r2.cloudflarestorage.com"
+        access_key_id: "SUA_R2_ACCESS_KEY_ID"
+        secret_access_key: "SUA_R2_SECRET_ACCESS_KEY"
         bucket: app-critico-backups-secundario
         prefix: app-critico/
       - name: oci-arquivo-frio
         type: oci_par
-        par_url_env: APP_CRITICO_OCI_PAR_URL
+        par_url: "https://objectstorage.SUA-REGIAO.oraclecloud.com/p/SEU-TOKEN-DA-PAR/n/SEU-NAMESPACE/b/SEU-BUCKET/o"
       - name: disco-secundario
         type: local
         path: /mnt/backup-secundario/app-critico/
     notifications:
       - type: telegram
         name: telegram-oncall
-        bot_token_env: APP_CRITICO_TELEGRAM_BOT_TOKEN
-        chat_id_env: APP_CRITICO_TELEGRAM_CHAT_ID
+        bot_token: "123456789:AAAbotTokenDeExemploAqui"
+        chat_id: "-1001234567890"
         on: [start, success, warning, failure]
       - type: email
-        smtp_host_env: SMTP_HOST
-        smtp_port_env: SMTP_PORT
-        smtp_user_env: SMTP_USER
-        smtp_password_env: SMTP_PASSWORD
-        from_env: SMTP_FROM
-        to_env: APP_CRITICO_EMAIL_TO
+        smtp_host: smtp.seuservidor.com
+        smtp_port: 587
+        smtp_user: "backups@seudominio.com"
+        smtp_password: "SUA_SENHA_SMTP"
+        from: "backups@seudominio.com"
+        to: "oncall@seudominio.com"
         on: [failure, warning]
       - type: webhook
         format: discord
-        url_env: APP_CRITICO_DISCORD_WEBHOOK_URL
+        url: "https://discord.com/api/webhooks/SEU/WEBHOOK/AQUI"
         on: [failure]
 
-  # 3) PROJETO PAUSADO/LEGADO — format: plain, enabled: false, único destino
-  #    e é "local" (o oposto do exemplo 1).
   - id: app-legado
     enabled: false
+    schedule: "0 4 * * *"
     format: plain
     connection:
       host: app-legado-postgres
       database: app_legado
-      password_env: APP_LEGADO_PGPASSWORD
+      password: "TROQUE-ESTA-SENHA-TAMBEM-2"
     destinations:
       - name: disco-secundario
         type: local
         path: /mnt/backup-secundario/app-legado/
     notifications:
       - type: ntfy
-        url_env: APP_LEGADO_NTFY_URL
+        url: "https://ntfy.sh/SEU-TOPICO-PRIVADO-E-DIFICIL-DE-ADIVINHAR"
         priority: default
         on: [failure]
 ```
 
 Cada `id` em `databases:` é a unidade atômica de agendamento/retenção/destino
 — exatamente o "parametrizado banco a banco" pedido: dois bancos no mesmo
-servidor Postgres viram duas entradas independentes.
+servidor Postgres viram duas entradas independentes, cada uma com sua própria
+cópia de tudo.
 
 ### Referência completa de parâmetros
 
-Qualquer campo de `defaults:` pode ser repetido dentro de um banco específico
-(mesmo caminho) para sobrescrever só aquele banco; o que não for repetido
-herda de `defaults:`, e o que não estiver em nenhum dos dois usa o "default
-do código" indicado abaixo.
+Todo campo abaixo é lido **só** do próprio banco — não existe herança de
+nenhuma outra parte do arquivo. "Default" na tabela é um valor fixo do
+próprio script (mesmo pra todo banco que omitir o campo), não configuração
+compartilhada.
 
-**`defaults:`** (raiz do YAML — os mesmos campos valem dentro de `databases[]`)
-
-| Campo | Tipo | Default do código | Descrição |
-|---|---|---|---|
-| `schedule` | string (cron, 5 campos) | `0 3 * * *` | Horário do backup. **Bancos com o mesmo `schedule` disparam em paralelo** (o `cron` não enfileira) — se tiver muitos bancos, considere escalonar os horários (`03:00`, `03:10`, `03:20`...) pra não competir por CPU/rede no mesmo instante. |
-| `format` | `custom` \| `plain` | `custom` | Formato do `pg_dump` (`-Fc`/`-Fp`). Com `plain` a checagem estrutural é pulada (`pg_restore --list` não existe pra SQL puro). **`directory` (`-Fd`) não é suportado ainda** — testado e confirmado quebrado: gera múltiplos arquivos numa pasta, e checksum/upload/verificação/retenção assumem hoje "um dump = um arquivo só" em todo o pipeline. Fica de fora até isso ser implementado de verdade. |
-| `retention.local_days` | inteiro | `7` | Dias que o dump fica no `BACKUP_DIR` de staging (`/backups`) antes de ser apagado. |
-| `retention.remote_days` | inteiro | `30` | Dias até apagar de **cada** destino em `destinations:` — vale para `s3`, `r2`, `oci_par` (se a PAR permitir delete) e `local`. |
-| `verify.structural_check` | boolean | `true` | `pg_restore --list` no dump logo após gerá-lo, antes do upload. |
-| `verify.checksum` | boolean | `true` | Gera `<arquivo>.sha256` e envia junto a cada destino. |
-| `verify.verify_upload` | boolean | `true` | Confere o tamanho do arquivo no destino logo após o envio. |
-| `verify.checksum_after_upload` | boolean | `false` | Confere um MD5 real do destino contra o local, sem re-baixar (lê `ETag`/`content-md5` via `HEAD`). Ver detalhes na seção "Verificações feitas em todo backup". |
-| `verify.test_restore` | boolean | `false` | Restore completo num banco descartável no mesmo servidor (`createdb`/`pg_restore`/`dropdb`). Exige `CREATEDB` no `connection.user`; mais caro, por isso opt-in. |
-
-**`remotes[]`** (raiz do YAML — remotes reutilizáveis do rclone, usados por destinos `type: s3`/`type: r2`)
-
-| Campo | Tipo | Obrigatório | Descrição |
-|---|---|---|---|
-| `name` | string | Sim | Referenciado por `destinations[].remote`. |
-| `type` | string | Sim | Hoje só `s3` é escrito pelo `render-rclone-conf.sh` — cobre qualquer backend que fale o protocolo S3 (AWS S3, Cloudflare R2, MinIO, Backblaze B2 via API S3 etc.). |
-| `provider` | string | Não | Dica pro rclone (`AWS`, `Cloudflare`, `Minio`, `Other`...). |
-| `region` | string | Não | Região S3 (ex.: `us-east-1`); ignorado por backends sem conceito de região (R2, por ex.). |
-| `endpoint_env` | string | Depende | Nome da env var com a URL do endpoint. Obrigatório pra qualquer backend que não seja AWS S3 "de verdade" (R2, MinIO...). |
-| `access_key_id_env` | string | Sim | Nome da env var com o Access Key ID. |
-| `secret_access_key_env` | string | Sim | Nome da env var com o Secret Access Key. |
-
-**`databases[]`** (raiz do YAML — um item por banco)
+**`databases[]`** (raiz do YAML — um item por banco, totalmente independente)
 
 | Campo | Tipo | Obrigatório | Default | Descrição |
 |---|---|---|---|---|
-| `id` | string | Sim | — | Identificador único; vira prefixo do nome do arquivo (`<id>_AAAA-MM-DD_HH-MM-SS.ext`) e é o argumento passado para `backup.sh`/`restore.sh`/`verify.sh`. |
+| `id` | string | Sim | — | Identificador único; vira prefixo do nome do arquivo (`<id>_AAAA-MM-DD_HH-MM-SS.ext`) e é o argumento passado para `backup.sh`/`restore.sh`/`resend.sh`/`verify.sh`. |
 | `enabled` | boolean | Não | `true` | `false` tira o banco do crontab gerado (ainda dá pra rodar `backup.sh <id>` manualmente). |
-| `schedule` | string (cron) | Não | herda de `defaults` | Override por banco. |
-| `format` | string | Não | herda de `defaults` | Override por banco. |
+| `schedule` | string (cron, 5 campos) | Não | `0 3 * * *` | Horário do backup. **Bancos com o mesmo `schedule` disparam em paralelo** (o `cron` não enfileira) — se tiver muitos bancos, considere escalonar os horários (`03:00`, `03:10`, `03:20`...) pra não competir por CPU/rede no mesmo instante. |
+| `format` | `custom` \| `plain` | Não | `custom` | Formato do `pg_dump` (`-Fc`/`-Fp`). Com `plain` a checagem estrutural é pulada (`pg_restore --list` não existe pra SQL puro). **`directory` (`-Fd`) não é suportado ainda** — testado e confirmado quebrado: gera múltiplos arquivos numa pasta, e checksum/upload/verificação/retenção assumem hoje "um dump = um arquivo só" em todo o pipeline; `backup.sh` recusa esse valor de propósito, com erro claro. |
 | `connection` | objeto | Sim | — | Ver tabela abaixo. |
-| `retention` | objeto | Não | herda de `defaults` | Mesmos campos `local_days`/`remote_days`, por banco. |
-| `verify` | objeto | Não | herda de `defaults` | Mesmos 5 campos de verificação, por banco. |
+| `retention.local_days` | inteiro | Não | `7` | Dias que o dump fica no `BACKUP_DIR` de staging (`/backups`) antes de ser apagado. |
+| `retention.remote_days` | inteiro | Não | `30` | Dias até apagar de **cada** destino em `destinations:` — vale para `s3`, `r2`, `oci_par` (se a PAR permitir delete) e `local`. |
+| `verify.structural_check` | boolean | Não | `true` | `pg_restore --list` no dump logo após gerá-lo, antes do upload. |
+| `verify.checksum` | boolean | Não | `true` | Gera `<arquivo>.sha256` e envia junto a cada destino. |
+| `verify.verify_upload` | boolean | Não | `true` | Confere o tamanho do arquivo no destino logo após o envio. |
+| `verify.checksum_after_upload` | boolean | Não | `false` | Confere um MD5 real do destino contra o local, sem re-baixar (lê `ETag`/`content-md5` via `HEAD`). Ver "Verificações feitas em todo backup". |
+| `verify.test_restore` | boolean | Não | `false` | Restore completo num banco descartável no mesmo servidor (`createdb`/`pg_restore`/`dropdb`). Exige `CREATEDB` no `connection.user`; mais caro, por isso opt-in. |
 | `destinations` | array (≥1) | Sim | — | Ver tabela abaixo. Sem nenhum item, o backup falha de propósito. |
-| `notifications` | array | Não | herda de `defaults.notifications` (tudo ou nada, sem merge campo a campo) | Ver seção "Notificações" abaixo. |
+| `notifications` | array | Não | (nenhuma notificação) | Ver seção "Notificações" abaixo. |
 
 **`databases[].connection`**
 
@@ -266,26 +226,33 @@ do código" indicado abaixo.
 | `port` | inteiro | Não | `5432` | Porta do Postgres. |
 | `user` | string | Não | `postgres` | Usuário do `pg_dump`/`pg_restore`; precisa de `CREATEDB` se `verify.test_restore: true`. |
 | `database` | string | Sim | — | Nome do banco a ser copiado. |
-| `password_env` | string | Sim | — | Nome da env var (do `.env`) com a senha desse usuário. |
+| `password` | string | Sim | — | Senha desse usuário, em texto puro (é por isso que `config/databases.yml` real fica fora do git). |
 
 **`databases[].destinations[]`** — campos comuns a todo item:
 
 | Campo | Tipo | Obrigatório | Descrição |
 |---|---|---|---|
-| `name` | string | Sim | Identifica o destino em `restore.sh ... latest/remote <name> ...`, nos logs e no `list.sh`. |
+| `name` | string | Sim | Identifica o destino em `restore.sh`/`resend.sh ... latest/remote <name> ...`, nos logs e no `list.sh`. |
 | `type` | `s3` \| `r2` \| `oci_par` \| `local` | Sim | Define quais campos abaixo se aplicam. |
 
-Campos extras por `type`:
+Campos extras por `type` — `s3`/`r2` **não referenciam nenhum remote
+compartilhado**: cada destino carrega sua própria credencial, montada numa
+["on the fly remote"](https://rclone.org/docs/#connection-strings) do rclone
+na hora do upload/download:
 
 | `type` | Campo | Obrigatório | Descrição |
 |---|---|---|---|
-| `s3` / `r2` | `remote` | Sim | Nome de um remote declarado em `remotes:`. |
+| `s3` / `r2` | `provider` | Não | Dica pro rclone (`AWS`, `Cloudflare`, `Minio`, `Other`...). |
+| `s3` / `r2` | `region` | Não | Região S3 (ex.: `us-east-1`); ignorado por backends sem conceito de região (R2, por ex.). |
+| `s3` / `r2` | `endpoint` | Depende | URL do endpoint S3-compatível. Obrigatório pra qualquer backend que não seja AWS S3 "de verdade" (R2, MinIO...). |
+| `s3` / `r2` | `access_key_id` | Sim | Access Key ID, em texto puro. |
+| `s3` / `r2` | `secret_access_key` | Sim | Secret Access Key, em texto puro. |
 | `s3` / `r2` | `bucket` | Sim | Nome do bucket. |
 | `s3` / `r2` | `prefix` | Não | Prefixo/"pasta" dentro do bucket (ex.: `meu-projeto/`). |
-| `oci_par` | `par_url_env` | Sim | Nome da env var com a URL da PAR (nível de bucket — ver requisitos de permissão na seção de tipos de destino, acima). |
+| `oci_par` | `par_url` | Sim | URL completa da PAR (nível de bucket — ver requisitos de permissão na seção de tipos de destino, abaixo). |
 | `local` | `path` | Sim | Caminho absoluto **dentro do container** onde copiar o dump; precisa estar montado como volume no `docker-compose.yml`. |
 
-**`databases[].notifications[]`** (ou `defaults.notifications[]`) — campos comuns a todo item:
+**`databases[].notifications[]`** — campos comuns a todo item:
 
 | Campo | Tipo | Obrigatório | Descrição |
 |---|---|---|---|
@@ -297,20 +264,20 @@ Campos extras por `type` (ver seção "Notificações" para detalhes de cada can
 
 | `type` | Campo | Obrigatório | Descrição |
 |---|---|---|---|
-| `webhook` | `url_env` | Sim | Nome da env var com a URL do webhook. |
+| `webhook` | `url` | Sim | URL do webhook, em texto puro. |
 | `webhook` | `format` | Não | `slack` (`{"text":...}`, default) \| `discord` (`{"content":...}`) \| `generic` (mesmo formato do slack). |
-| `telegram` | `bot_token_env` | Sim | Nome da env var com o token do bot (via [@BotFather](https://t.me/BotFather)). |
-| `telegram` | `chat_id_env` | Sim | Nome da env var com o `chat_id` de destino. |
-| `email` | `smtp_host_env` | Sim | Nome da env var com o host SMTP. |
-| `email` | `smtp_port_env` | Não | Nome da env var com a porta; sem isso, `587` (STARTTLS). |
-| `email` | `smtp_user_env` | Sim | Nome da env var com o usuário SMTP. |
-| `email` | `smtp_password_env` | Sim | Nome da env var com a senha SMTP. |
-| `email` | `from_env` | Sim | Nome da env var com o remetente (`From:`). |
-| `email` | `to_env` | Sim | Nome da env var com o(s) destinatário(s). |
-| `ntfy` | `url_env` | Sim | Nome da env var com a URL completa do tópico (ex.: `https://ntfy.sh/meu-topico`). |
-| `ntfy` | `priority` | Não | `min`\|`low`\|`default`\|`high`\|`urgent` (não é `*_env` — vai direto no YAML, não é segredo). |
+| `telegram` | `bot_token` | Sim | Token do bot (via [@BotFather](https://t.me/BotFather)), em texto puro. |
+| `telegram` | `chat_id` | Sim | `chat_id` de destino. |
+| `email` | `smtp_host` | Sim | Host SMTP. |
+| `email` | `smtp_port` | Não | Porta; default `587` (STARTTLS). |
+| `email` | `smtp_user` | Sim | Usuário SMTP. |
+| `email` | `smtp_password` | Sim | Senha SMTP, em texto puro. |
+| `email` | `from` | Sim | Remetente (`From:`). |
+| `email` | `to` | Sim | Destinatário(s). |
+| `ntfy` | `url` | Sim | URL completa do tópico (ex.: `https://ntfy.sh/meu-topico`). |
+| `ntfy` | `priority` | Não | `min`\|`low`\|`default`\|`high`\|`urgent`. |
 
-**Fora do YAML** (variáveis de ambiente lidas direto pelo container, via `.env`/compose `environment:`):
+**Fora do YAML** (variáveis de ambiente lidas direto pelo container, via compose `environment:` — nada sensível fica aqui):
 
 | Variável | Default | Descrição |
 |---|---|---|
@@ -320,9 +287,15 @@ Campos extras por `type` (ver seção "Notificações" para detalhes de cada can
 
 ### Tipos de destino suportados hoje
 
-- **`s3`** / **`r2`** — via `rclone`, para qualquer remote S3-compatível
-  declarado em `remotes:`. Suporta upload, download, listagem (`latest`) e
-  retenção remota automática (`rclone delete --min-age`).
+- **`s3`** / **`r2`** — via `rclone`, para qualquer backend S3-compatível
+  (AWS S3, Cloudflare R2, MinIO, Backblaze B2 via API S3 etc.), credenciais
+  embutidas por destino. Suporta upload, download, listagem (`latest`) e
+  retenção remota automática (`rclone delete --min-age`) — testado de ponta a
+  ponta contra um MinIO real, incluindo o mecanismo de "remote on the fly"
+  (sem `rclone.conf`, sem remote nomeado): confirmei via dump de tráfego HTTP
+  que `rclone hashsum` usa `HEAD`, não baixa o arquivo, e que `mkdir`/`copy`/
+  `lsf`/`delete` funcionam normalmente só com a string de conexão montada na
+  hora.
 - **`oci_par`** — Pre-Authenticated Request da OCI Object Storage. Sem SDK,
   sem chaves de API: o script faz `curl -X PUT`/`GET`/`DELETE` direto na URL
   da PAR. Crie uma PAR **a nível de bucket** (raiz do bucket, não de um objeto
@@ -350,19 +323,12 @@ Campos extras por `type` (ver seção "Notificações" para detalhes de cada can
   disso). O `path` precisa estar montado como volume no `docker-compose.yml`.
   Suporta upload, `verify_upload`, `latest`, `remote` e retenção automática
   (mesmo critério de idade por nome de arquivo usado no staging).
-- **Outros métodos**: qualquer backend que o `rclone` suporte (Backblaze B2,
-  Google Cloud Storage, Azure Blob, SFTP, WebDAV, disco local...) já funciona
-  bastando declarar um novo `remotes:` com `type` compatível e usar
-  `type: s3` só quando for de fato S3; para os outros protocolos do rclone,
-  adicione o tipo correspondente no `remotes:` e estenda `render-rclone-conf.sh`
-  (hoje ele só escreve o formato de um remote `s3`, mas o `backup.sh`/`restore.sh`
-  já tratam `s3`/`r2` de forma genérica via rclone).
 
 ## Notificações
 
-Cada banco pode ter uma lista de canais em `notifications:` (própria, ou
-herdada de `defaults.notifications` — sempre tudo-ou-nada, nunca um merge
-campo a campo). Cada canal escolhe em quais eventos dispara via `on:`:
+Cada banco pode ter uma lista de canais em `notifications:` — sem herança de
+lugar nenhum; um banco sem `notifications:` simplesmente não notifica nada.
+Cada canal escolhe em quais eventos dispara via `on:`:
 
 - **`start`** — logo antes de começar o `pg_dump`.
 - **`success`** — todos os destinos configurados receberam o backup.
@@ -372,7 +338,8 @@ campo a campo). Cada canal escolhe em quais eventos dispara via `on:`:
   existe em algum lugar, só não replicou por completo). Retenção remota que
   falha também dispara `warning`. O `backup.sh` ainda sai com exit code `1`
   nesse caso, pra ferramentas de monitoramento de cron perceberem que ficou
-  pendência, mesmo não sendo uma perda total.
+  pendência, mesmo não sendo uma perda total. A mensagem já sugere usar
+  `resend.sh` pra tentar de novo sem gerar um dump novo — ver seção abaixo.
 - **`failure`** — falha total: `pg_dump`/checagem estrutural/restore de teste
   falhou, ou **todos** os destinos falharam no upload.
 
@@ -430,14 +397,16 @@ docker compose exec pg-backup /app/scripts/resend.sh app-critico app-critico_202
 
 O `resend.sh` roda a mesma lógica de upload/`verify_upload`/`checksum_after_upload`
 do `backup.sh`, só que pulando `pg_dump` inteiro — e dispara notificação
-(`success`/`warning`/`failure`) igual a um backup normal. É exatamente o que
-a mensagem de `warning` de um backup parcial já sugere fazer.
+(`success`/`warning`/`failure`) igual a um backup normal.
 
 ## Verificações feitas em todo backup
 
 1. **Checagem estrutural** — `pg_restore --list` no arquivo recém-gerado,
    antes de subir para qualquer destino. Pega dump truncado/corrompido cedo,
-   sem gastar upload.
+   sem gastar upload. Se falhar, **o arquivo é apagado** (testado: uma falha
+   de `pg_dump` — ex.: senha errada — não deixa mais um `.dump` vazio/quebrado
+   em `/backups`, que `restore.sh`/`resend.sh latest` poderiam pegar sem
+   perceber que é lixo).
 2. **Checksum** — SHA-256 do dump, salvo como `<arquivo>.sha256` e enviado
    junto a cada destino.
 3. **Verificação de upload** — após enviar, confere se o tamanho do objeto no
@@ -469,8 +438,8 @@ a mensagem de `warning` de um backup parcial já sugere fazer.
 
 ```bash
 cp config/databases.example.yml config/databases.yml
-cp .env.example .env
-# edite os dois arquivos com seus bancos/segredos reais
+chmod 600 config/databases.yml
+# edite com seus bancos/segredos reais
 ```
 
 Ajuste `docker-compose.yml` para entrar nas networks Docker corretas (por
@@ -521,38 +490,39 @@ docker compose exec pg-backup /app/scripts/list.sh
 
 ### 7. Aplicar mudanças de configuração
 
-O `rclone.conf` e o crontab só são gerados **uma vez**, no boot do container
-(`entrypoint.sh`). Editar `config/databases.yml` ou `.env` no host não muda
-nada sozinho — o comando certo depende de qual arquivo mudou (testado e
-confirmado com containers reais):
+O crontab só é gerado **uma vez**, no boot do container (`entrypoint.sh`).
+Editar `config/databases.yml` no host não muda nada sozinho — como é tudo um
+único arquivo agora (sem `.env` separado), a regra é simples: **qualquer
+mudança no YAML precisa de `docker compose restart pg-backup`**. É um bind
+mount, então o Compose não enxerga isso como mudança de configuração — `up -d`
+sozinho **não faz nada** (testado: mesmo container, crontab antigo continua
+valendo até reiniciar).
 
-| O que mudou | Comando | Por quê |
-|---|---|---|
-| `config/databases.yml` (bancos, schedule, retenção, destinos) | `docker compose restart pg-backup` | É um bind mount: o Compose não enxerga isso como mudança de configuração, então `up -d` sozinho **não faz nada** (container continua rodando com o crontab antigo). `restart` reinicia o processo e roda o `entrypoint.sh` de novo, que relê o YAML atual. |
-| `.env` (senhas, chaves, URLs de webhook/PAR) | `docker compose up -d` | O Compose detecta a mudança nas variáveis de ambiente resolvidas e recria o container sozinho (não precisa de `restart` nem `--build`). |
-| `Dockerfile` ou qualquer arquivo em `scripts/` | `docker compose up -d --build` | Precisa reconstruir a imagem antes de recriar o container. |
-| Só quer garantir que pegou tudo, sem pensar em qual regra vale | `docker compose up -d --force-recreate` (ou `--build` junto, se mexeu em código) | Recria do zero sempre, custa só alguns segundos a mais. |
+| O que mudou | Comando |
+|---|---|
+| `config/databases.yml` (qualquer campo — bancos, schedule, credenciais, destinos) | `docker compose restart pg-backup` |
+| `Dockerfile` ou qualquer arquivo em `scripts/` | `docker compose up -d --build` |
 
 Depois de qualquer uma dessas, confira com `docker compose exec pg-backup /app/scripts/list.sh` e `docker compose exec pg-backup crontab -l` se o crontab reflete o que você esperava.
 
 ## Adicionando um novo projeto
 
-Basta um novo item em `databases:` no YAML (host, credenciais via `.env`,
-schedule, destinos) — sem build de imagem nova, sem editar compose de projeto
-nenhum. Depois, aplique a mudança como descrito acima (`docker compose
-restart pg-backup` cobre o caso comum de só ter mexido no YAML). Se o projeto
-estiver numa network Docker diferente da já conectada, adicione essa network
-em `docker-compose.yml` e rode `docker compose up -d` (mudança no próprio
+Basta um novo item em `databases:` no YAML, completo (host, senha, schedule,
+destinos com suas próprias credenciais) — sem build de imagem nova, sem
+editar compose de projeto nenhum, sem mexer em nenhum outro banco já
+configurado. Depois, `docker compose restart pg-backup`. Se o projeto estiver
+numa network Docker diferente da já conectada, adicione essa network em
+`docker-compose.yml` e rode `docker compose up -d` (mudança no próprio
 arquivo do compose, então o Compose recria o container sozinho).
 
 ## Notas de segurança
 
-- `.env` e `config/databases.yml` reais nunca são versionados (`.gitignore`).
-- Os campos sensíveis no YAML são sempre *nomes* de variável, nunca o valor.
+- `config/databases.yml` real nunca é versionado (`.gitignore`) — é ele que
+  guarda toda senha/chave/token em texto puro agora, então rode
+  `chmod 600 config/databases.yml` no host.
 - A PAR da OCI já É o segredo — trate a URL como uma senha.
-- O crontab gerado (`/var/spool/cron/crontabs/root` dentro do container)
-  também acaba guardando os valores resolvidos de `.env` em texto puro — é
-  necessário pro cron conseguir rodar os jobs sozinho (ver seção "Como
-  funciona"). O arquivo fica `0600`, só root, mesmo nível de proteção que o
-  resto do container já tinha (`.env` montado, `rclone.conf` etc.) — não é
-  uma exposição nova, só vale saber que esse arquivo também é sensível.
+- O crontab gerado (`/var/spool/cron/crontabs/root` dentro do container) **não**
+  contém segredo nenhum — só `TZ`/`CONFIG_FILE`/`BACKUP_DIR` e o horário de
+  cada banco. Os scripts leem senha/chaves direto do YAML em tempo de
+  execução, então não há necessidade de propagar nada sensível pro ambiente
+  do cron.
